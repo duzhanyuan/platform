@@ -1,10 +1,10 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package manualtesting
 
 import (
-	l4g "code.google.com/p/log4go"
+	l4g "github.com/alecthomas/log4go"
 	"github.com/mattermost/platform/api"
 	"github.com/mattermost/platform/model"
 	"github.com/mattermost/platform/utils"
@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-type TestEnviroment struct {
+type TestEnvironment struct {
 	Params        map[string][]string
 	Client        *model.Client
 	CreatedTeamId string
@@ -32,12 +32,12 @@ func InitManualTesting() {
 
 func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 	// Let the world know
-	l4g.Info("Setting up for manual test...")
+	l4g.Info(utils.T("manaultesting.manual_test.setup.info"))
 
 	// URL Parameters
 	params, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
-		c.Err = model.NewAppError("/manual", "Unable to parse URL", "")
+		c.Err = model.NewLocAppError("/manual", "manaultesting.manual_test.parse.app_error", nil, "")
 		return
 	}
 
@@ -49,25 +49,25 @@ func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 		hash := hasher.Sum32()
 		rand.Seed(int64(hash))
 	} else {
-		l4g.Debug("No uid in url")
+		l4g.Debug(utils.T("manaultesting.manual_test.uid.debug"))
 	}
 
 	// Create a client for tests to use
-	client := model.NewClient("http://localhost:" + utils.Cfg.ServiceSettings.Port + "/api/v1")
+	client := model.NewClient("http://localhost" + utils.Cfg.ServiceSettings.ListenAddress)
 
 	// Check for username parameter and create a user if present
 	username, ok1 := params["username"]
-	teamname, ok2 := params["teamname"]
+	teamDisplayName, ok2 := params["teamname"]
 	var teamID string
 	var userID string
 	if ok1 && ok2 {
-		l4g.Info("Creating user and team")
+		l4g.Info(utils.T("manaultesting.manual_test.create.info"))
 		// Create team for testing
 		team := &model.Team{
-			Name:   teamname[0],
-			Domain: utils.RandomName(utils.Range{20, 20}, utils.LOWERCASE),
-			Email:  utils.RandomEmail(utils.Range{20, 20}, utils.LOWERCASE),
-			Type:   model.TEAM_OPEN,
+			DisplayName: teamDisplayName[0],
+			Name:        utils.RandomName(utils.Range{20, 20}, utils.LOWERCASE),
+			Email:       "success+" + model.NewId() + "simulator.amazonses.com",
+			Type:        model.TEAM_OPEN,
 		}
 
 		if result := <-api.Srv.Store.Team().Save(team); result.Err != nil {
@@ -78,7 +78,7 @@ func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 			createdTeam := result.Data.(*model.Team)
 
 			channel := &model.Channel{DisplayName: "Town Square", Name: "town-square", Type: model.CHANNEL_OPEN, TeamId: createdTeam.Id}
-			if _, err := api.CreateChannel(c, channel, r.URL.Path, false); err != nil {
+			if _, err := api.CreateChannel(c, channel, false); err != nil {
 				c.Err = err
 				return
 			}
@@ -88,9 +88,8 @@ func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 
 		// Create user for testing
 		user := &model.User{
-			TeamId:   teamID,
-			Email:    utils.RandomEmail(utils.Range{20, 20}, utils.LOWERCASE),
-			FullName: username[0],
+			Email:    "success+" + model.NewId() + "simulator.amazonses.com",
+			Nickname: username[0],
 			Password: api.USER_PASSWORD}
 
 		result, err := client.CreateUser(user, "")
@@ -98,7 +97,10 @@ func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 			c.Err = err
 			return
 		}
-		api.Srv.Store.User().VerifyEmail(result.Data.(*model.User).Id)
+
+		<-api.Srv.Store.User().VerifyEmail(result.Data.(*model.User).Id)
+		<-api.Srv.Store.Team().SaveMember(&model.TeamMember{TeamId: teamID, UserId: result.Data.(*model.User).Id})
+
 		newuser := result.Data.(*model.User)
 		userID = newuser.Id
 
@@ -111,18 +113,18 @@ func manualTest(c *api.Context, w http.ResponseWriter, r *http.Request) {
 
 		// Respond with an auth token this can be overriden by a specific test as required
 		sessionCookie := &http.Cookie{
-			Name:     model.SESSION_TOKEN,
+			Name:     model.SESSION_COOKIE_TOKEN,
 			Value:    client.AuthToken,
 			Path:     "/",
-			MaxAge:   model.SESSION_TIME_WEB_IN_SECS,
+			MaxAge:   *utils.Cfg.ServiceSettings.SessionLengthWebInDays * 60 * 60 * 24,
 			HttpOnly: true,
 		}
 		http.SetCookie(w, sessionCookie)
 		http.Redirect(w, r, "/channels/town-square", http.StatusTemporaryRedirect)
 	}
 
-	// Setup test enviroment
-	env := TestEnviroment{
+	// Setup test environment
+	env := TestEnvironment{
 		Params:        params,
 		Client:        client,
 		CreatedTeamId: teamID,
@@ -153,17 +155,17 @@ func getChannelID(channelname string, teamid string, userid string) (id string, 
 	// Grab all the channels
 	result := <-api.Srv.Store.Channel().GetChannels(teamid, userid)
 	if result.Err != nil {
-		l4g.Debug("Unable to get channels")
+		l4g.Debug(utils.T("manaultesting.get_channel_id.unable.debug"))
 		return "", false
 	}
 
-	data := result.Data.(*model.ChannelList)
+	data := result.Data.(model.ChannelList)
 
-	for _, channel := range data.Channels {
+	for _, channel := range data {
 		if channel.Name == channelname {
 			return channel.Id, true
 		}
 	}
-	l4g.Debug("Could not find channel: " + channelname + ", " + strconv.Itoa(len(data.Channels)) + " possibilites searched")
+	l4g.Debug(utils.T("manaultesting.get_channel_id.no_found.debug"), channelname, strconv.Itoa(len(data)))
 	return "", false
 }

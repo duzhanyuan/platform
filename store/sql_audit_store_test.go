@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package store
@@ -6,17 +6,24 @@ package store
 import (
 	"github.com/mattermost/platform/model"
 	"testing"
+	"time"
 )
 
 func TestSqlAuditStore(t *testing.T) {
 	Setup()
 
 	audit := &model.Audit{UserId: model.NewId(), IpAddress: "ipaddress", Action: "Action"}
-	<-store.Audit().Save(audit)
-	<-store.Audit().Save(audit)
-	<-store.Audit().Save(audit)
+	Must(store.Audit().Save(audit))
+	time.Sleep(100 * time.Millisecond)
+	Must(store.Audit().Save(audit))
+	time.Sleep(100 * time.Millisecond)
+	Must(store.Audit().Save(audit))
+	time.Sleep(100 * time.Millisecond)
 	audit.ExtraInfo = "extra"
-	<-store.Audit().Save(audit)
+	time.Sleep(100 * time.Millisecond)
+	Must(store.Audit().Save(audit))
+
+	time.Sleep(100 * time.Millisecond)
 
 	c := store.Audit().Get(audit.UserId, 100)
 	result := <-c
@@ -36,5 +43,17 @@ func TestSqlAuditStore(t *testing.T) {
 
 	if len(audits) != 0 {
 		t.Fatal("Should have returned empty because user_id is missing")
+	}
+
+	c = store.Audit().Get("", 100)
+	result = <-c
+	audits = result.Data.(model.Audits)
+
+	if len(audits) <= 4 {
+		t.Fatal("Failed to save and retrieve 4 audit logs")
+	}
+
+	if r2 := <-store.Audit().PermanentDeleteByUser(audit.UserId); r2.Err != nil {
+		t.Fatal(r2.Err)
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -6,28 +6,38 @@ package model
 import (
 	"encoding/json"
 	"io"
+	"unicode/utf8"
 )
 
 const (
-	POST_DEFAULT = ""
+	POST_SYSTEM_MESSAGE_PREFIX = "system_"
+	POST_DEFAULT               = ""
+	POST_SLACK_ATTACHMENT      = "slack_attachment"
+	POST_SYSTEM_GENERIC        = "system_generic"
+	POST_JOIN_LEAVE            = "system_join_leave"
+	POST_ADD_REMOVE            = "system_add_remove"
+	POST_HEADER_CHANGE         = "system_header_change"
+	POST_CHANNEL_DELETED       = "system_channel_deleted"
+	POST_EPHEMERAL             = "system_ephemeral"
 )
 
 type Post struct {
-	Id         string      `json:"id"`
-	CreateAt   int64       `json:"create_at"`
-	UpdateAt   int64       `json:"update_at"`
-	DeleteAt   int64       `json:"delete_at"`
-	UserId     string      `json:"user_id"`
-	ChannelId  string      `json:"channel_id"`
-	RootId     string      `json:"root_id"`
-	ParentId   string      `json:"parent_id"`
-	OriginalId string      `json:"original_id"`
-	Message    string      `json:"message"`
-	ImgCount   int64       `json:"img_count"`
-	Type       string      `json:"type"`
-	Props      StringMap   `json:"props"`
-	Hashtags   string      `json:"hashtags"`
-	Filenames  StringArray `json:"filenames"`
+	Id            string          `json:"id"`
+	CreateAt      int64           `json:"create_at"`
+	UpdateAt      int64           `json:"update_at"`
+	DeleteAt      int64           `json:"delete_at"`
+	UserId        string          `json:"user_id"`
+	ChannelId     string          `json:"channel_id"`
+	RootId        string          `json:"root_id"`
+	ParentId      string          `json:"parent_id"`
+	OriginalId    string          `json:"original_id"`
+	Message       string          `json:"message"`
+	Type          string          `json:"type"`
+	Props         StringInterface `json:"props"`
+	Hashtags      string          `json:"hashtags"`
+	Filenames     StringArray     `json:"filenames,omitempty"` // Deprecated, do not use this field any more
+	FileIds       StringArray     `json:"file_ids,omitempty"`
+	PendingPostId string          `json:"pending_post_id" db:"-"`
 }
 
 func (o *Post) ToJson() string {
@@ -57,55 +67,64 @@ func (o *Post) Etag() string {
 func (o *Post) IsValid() *AppError {
 
 	if len(o.Id) != 26 {
-		return NewAppError("Post.IsValid", "Invalid Id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.id.app_error", nil, "")
 	}
 
 	if o.CreateAt == 0 {
-		return NewAppError("Post.IsValid", "Create at must be a valid time", "id="+o.Id)
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.create_at.app_error", nil, "id="+o.Id)
 	}
 
 	if o.UpdateAt == 0 {
-		return NewAppError("Post.IsValid", "Update at must be a valid time", "id="+o.Id)
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.update_at.app_error", nil, "id="+o.Id)
 	}
 
 	if len(o.UserId) != 26 {
-		return NewAppError("Post.IsValid", "Invalid user id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.user_id.app_error", nil, "")
 	}
 
 	if len(o.ChannelId) != 26 {
-		return NewAppError("Post.IsValid", "Invalid channel id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.channel_id.app_error", nil, "")
 	}
 
 	if !(len(o.RootId) == 26 || len(o.RootId) == 0) {
-		return NewAppError("Post.IsValid", "Invalid root id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.root_id.app_error", nil, "")
 	}
 
 	if !(len(o.ParentId) == 26 || len(o.ParentId) == 0) {
-		return NewAppError("Post.IsValid", "Invalid parent id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.parent_id.app_error", nil, "")
 	}
 
 	if len(o.ParentId) == 26 && len(o.RootId) == 0 {
-		return NewAppError("Post.IsValid", "Invalid root id must be set if parent id set", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.root_parent.app_error", nil, "")
 	}
 
 	if !(len(o.OriginalId) == 26 || len(o.OriginalId) == 0) {
-		return NewAppError("Post.IsValid", "Invalid original id", "")
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.original_id.app_error", nil, "")
 	}
 
-	if len(o.Message) > 4000 {
-		return NewAppError("Post.IsValid", "Invalid message", "id="+o.Id)
+	if utf8.RuneCountInString(o.Message) > 4000 {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.msg.app_error", nil, "id="+o.Id)
 	}
 
-	if len(o.Hashtags) > 1000 {
-		return NewAppError("Post.IsValid", "Invalid hashtags", "id="+o.Id)
+	if utf8.RuneCountInString(o.Hashtags) > 1000 {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.hashtags.app_error", nil, "id="+o.Id)
 	}
 
-	if !(o.Type == POST_DEFAULT) {
-		return NewAppError("Post.IsValid", "Invalid type", "id="+o.Type)
+	// should be removed once more message types are supported
+	if !(o.Type == POST_DEFAULT || o.Type == POST_JOIN_LEAVE || o.Type == POST_ADD_REMOVE || o.Type == POST_SLACK_ATTACHMENT || o.Type == POST_HEADER_CHANGE) {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.type.app_error", nil, "id="+o.Type)
 	}
 
-	if len(ArrayToJson(o.Filenames)) > 4000 {
-		return NewAppError("Post.IsValid", "Invalid filenames", "id="+o.Id)
+	if utf8.RuneCountInString(ArrayToJson(o.Filenames)) > 4000 {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.filenames.app_error", nil, "id="+o.Id)
+	}
+
+	if utf8.RuneCountInString(ArrayToJson(o.FileIds)) > 150 {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.file_ids.app_error", nil, "id="+o.Id)
+	}
+
+	if utf8.RuneCountInString(StringInterfaceToJson(o.Props)) > 8000 {
+		return NewLocAppError("Post.IsValid", "model.post.is_valid.props.app_error", nil, "id="+o.Id)
 	}
 
 	return nil
@@ -118,30 +137,38 @@ func (o *Post) PreSave() {
 
 	o.OriginalId = ""
 
-	o.CreateAt = GetMillis()
+	if o.CreateAt == 0 {
+		o.CreateAt = GetMillis()
+	}
+
 	o.UpdateAt = o.CreateAt
 
 	if o.Props == nil {
-		o.Props = make(map[string]string)
+		o.Props = make(map[string]interface{})
 	}
 
 	if o.Filenames == nil {
 		o.Filenames = []string{}
+	}
+
+	if o.FileIds == nil {
+		o.FileIds = []string{}
 	}
 }
 
 func (o *Post) MakeNonNil() {
 	if o.Props == nil {
-		o.Props = make(map[string]string)
-	}
-	if o.Filenames == nil {
-		o.Filenames = []string{}
+		o.Props = make(map[string]interface{})
 	}
 }
 
-func (o *Post) AddProp(key string, value string) {
+func (o *Post) AddProp(key string, value interface{}) {
 
 	o.MakeNonNil()
 
 	o.Props[key] = value
+}
+
+func (o *Post) IsSystemMessage() bool {
+	return len(o.Type) >= len(POST_SYSTEM_MESSAGE_PREFIX) && o.Type[:len(POST_SYSTEM_MESSAGE_PREFIX)] == POST_SYSTEM_MESSAGE_PREFIX
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -64,6 +64,31 @@ func TestChannelIsValid(t *testing.T) {
 
 	o.Type = "P"
 
+	if err := o.IsValid(); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Header = strings.Repeat("01234567890", 100)
+	if err := o.IsValid(); err == nil {
+		t.Fatal("should be invalid")
+	}
+
+	o.Header = "1234"
+	if err := o.IsValid(); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Purpose = strings.Repeat("01234567890", 30)
+	if err := o.IsValid(); err == nil {
+		t.Fatal("should be invalid")
+	}
+
+	o.Purpose = "1234"
+	if err := o.IsValid(); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Purpose = strings.Repeat("0123456789", 25)
 	if err := o.IsValid(); err != nil {
 		t.Fatal(err)
 	}

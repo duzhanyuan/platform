@@ -2,11 +2,22 @@
 logs
 .DS_Store
 node_modules
-dist
+/dist
+/webapp/dist
 npm-debug.log
 
-bundle*.js
+web/static/js/bundle*.js
+web/static/js/bundle*.js.map
+web/static/js/libs*.js
 
+config/active.dat
+
+# Enteprise imports file
+imports.go
+
+# Build Targets
+.prebuild
+.npminstall
 
 # Compiled Object files, Static and Dynamic libs (Shared Objects)
 *.o
@@ -18,7 +29,6 @@ _obj
 _test
 
 # Architecture specific extensions/prefixes
-*.[568vq]
 [568vq].out
 
 *.cgo1.go
@@ -37,8 +47,15 @@ _testmain.go
 *mattermost.log
 *npm-debug.log*
 
+.tmp
+
 # Vim temporary files
-*.swp
+[._]*.s[a-w][a-z]
+[._]s[a-w][a-z]
+*.un~
+Session.vim
+.netrwhist
+*~
 
 # Build files
 *bundle.js
@@ -47,3 +64,17 @@ web/sass-files/sass/.sass-cache/
 *config.codekit
 *.sass-cache
 *styles.css
+
+# Default local file storage
+data/*
+webapp/data/*
+api/data/*
+
+enterprise
+
+cover.out
+ecover.out
+
+.agignore
+.ctags
+tags

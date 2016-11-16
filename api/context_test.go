@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
@@ -8,53 +8,45 @@ import (
 	"testing"
 )
 
-var ipAddressTests = []struct {
-	address  string
-	expected bool
-}{
-	{"126.255.255.255", false},
-	{"127.0.0.1", true},
-	{"127.0.0.4", false},
-	{"9.255.255.255", false},
-	{"10.0.0.1", true},
-	{"11.0.0.1", false},
-	{"176.15.155.255", false},
-	{"176.16.0.1", true},
-	{"176.31.0.1", false},
-	{"192.167.255.255", false},
-	{"192.168.0.1", true},
-	{"192.169.0.1", false},
+func TestCache(t *testing.T) {
+	session := &model.Session{
+		Id:     model.NewId(),
+		Token:  model.NewId(),
+		UserId: model.NewId(),
+	}
+
+	sessionCache.AddWithExpiresInSecs(session.Token, session, 5*60)
+
+	keys := sessionCache.Keys()
+	if len(keys) <= 0 {
+		t.Fatal("should have items")
+	}
+
+	RemoveAllSessionsForUserId(session.UserId)
+
+	rkeys := sessionCache.Keys()
+	if len(rkeys) != len(keys)-1 {
+		t.Fatal("should have one less")
+	}
 }
 
-func TestIpAddress(t *testing.T) {
-	for _, v := range ipAddressTests {
-		if IsPrivateIpAddress(v.address) != v.expected {
-			t.Errorf("expect %v as %v", v.address, v.expected)
+func TestSiteURL(t *testing.T) {
+	c := &Context{}
+
+	testCases := []struct {
+		url  string
+		want string
+	}{
+		{"http://mattermost.com/", "http://mattermost.com"},
+		{"http://mattermost.com", "http://mattermost.com"},
+	}
+
+	for _, tc := range testCases {
+		c.SetSiteURL(tc.url)
+
+		if c.siteURL != tc.want {
+			t.Fatalf("expected %s, got %s", tc.want, c.siteURL)
 		}
 	}
-}
 
-func TestContext(t *testing.T) {
-	context := Context{}
-
-	context.IpAddress = "127.0.0.1"
-	context.Session.UserId = "5"
-
-	if !context.HasPermissionsToUser("5", "") {
-		t.Fatal("should have permissions")
-	}
-
-	if context.HasPermissionsToUser("6", "") {
-		t.Fatal("shouldn't have permissions")
-	}
-
-	context.Session.Roles = model.ROLE_SYSTEM_ADMIN
-	if !context.HasPermissionsToUser("6", "") {
-		t.Fatal("should have permissions")
-	}
-
-	context.IpAddress = "125.0.0.1"
-	if context.HasPermissionsToUser("6", "") {
-		t.Fatal("shouldn't have permissions")
-	}
 }

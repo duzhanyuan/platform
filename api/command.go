@@ -1,474 +1,532 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
-	l4g "code.google.com/p/log4go"
-	"github.com/gorilla/mux"
+	"crypto/tls"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"strings"
+
+	l4g "github.com/alecthomas/log4go"
+
 	"github.com/mattermost/platform/model"
 	"github.com/mattermost/platform/utils"
-	"net/http"
-	"strconv"
-	"strings"
 )
 
-type commandHandler func(c *Context, command *model.Command) bool
-
-var commands = []commandHandler{
-	logoutCommand,
-	joinCommand,
-	loadTestCommand,
+type CommandProvider interface {
+	GetTrigger() string
+	GetCommand(c *Context) *model.Command
+	DoCommand(c *Context, channelId string, message string) *model.CommandResponse
 }
 
-func InitCommand(r *mux.Router) {
-	l4g.Debug("Initializing command api routes")
-	r.Handle("/command", ApiUserRequired(command)).Methods("POST")
+var commandProviders = make(map[string]CommandProvider)
 
-	if utils.Cfg.TeamSettings.AllowValet {
-		commands = append(commands, echoCommand)
+func RegisterCommandProvider(newProvider CommandProvider) {
+	commandProviders[newProvider.GetTrigger()] = newProvider
+}
+
+func GetCommandProvider(name string) CommandProvider {
+	provider, ok := commandProviders[name]
+	if ok {
+		return provider
 	}
 
-	hub.Start()
+	return nil
 }
 
-func command(c *Context, w http.ResponseWriter, r *http.Request) {
+func InitCommand() {
+	l4g.Debug(utils.T("api.command.init.debug"))
+
+	BaseRoutes.Commands.Handle("/execute", ApiUserRequired(executeCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/list", ApiUserRequired(listCommands)).Methods("GET")
+
+	BaseRoutes.Commands.Handle("/create", ApiUserRequired(createCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/update", ApiUserRequired(updateCommand)).Methods("POST")
+	BaseRoutes.Commands.Handle("/list_team_commands", ApiUserRequired(listTeamCommands)).Methods("GET")
+	BaseRoutes.Commands.Handle("/regen_token", ApiUserRequired(regenCommandToken)).Methods("POST")
+	BaseRoutes.Commands.Handle("/delete", ApiUserRequired(deleteCommand)).Methods("POST")
+
+	BaseRoutes.Teams.Handle("/command_test", ApiAppHandler(testCommand)).Methods("POST")
+	BaseRoutes.Teams.Handle("/command_test", ApiAppHandler(testCommand)).Methods("GET")
+	BaseRoutes.Teams.Handle("/command_test_e", ApiAppHandler(testEphemeralCommand)).Methods("POST")
+	BaseRoutes.Teams.Handle("/command_test_e", ApiAppHandler(testEphemeralCommand)).Methods("GET")
+}
+
+func listCommands(c *Context, w http.ResponseWriter, r *http.Request) {
+	commands := make([]*model.Command, 0, 32)
+	seen := make(map[string]bool)
+	for _, value := range commandProviders {
+		cpy := *value.GetCommand(c)
+		if cpy.AutoComplete && !seen[cpy.Id] {
+			cpy.Sanitize()
+			seen[cpy.Trigger] = true
+			commands = append(commands, &cpy)
+		}
+	}
+
+	if *utils.Cfg.ServiceSettings.EnableCommands {
+		if result := <-Srv.Store.Command().GetByTeam(c.TeamId); result.Err != nil {
+			c.Err = result.Err
+			return
+		} else {
+			teamCmds := result.Data.([]*model.Command)
+			for _, cmd := range teamCmds {
+				if cmd.AutoComplete && !seen[cmd.Id] {
+					cmd.Sanitize()
+					seen[cmd.Trigger] = true
+					commands = append(commands, cmd)
+				}
+			}
+		}
+	}
+
+	w.Write([]byte(model.CommandListToJson(commands)))
+}
+
+func executeCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	props := model.MapFromJson(r.Body)
+	command := strings.TrimSpace(props["command"])
+	channelId := strings.TrimSpace(props["channelId"])
+
+	if len(command) <= 1 || strings.Index(command, "/") != 0 {
+		c.Err = model.NewLocAppError("executeCommand", "api.command.execute_command.start.app_error", nil, "")
+		return
+	}
+
+	if len(channelId) > 0 {
+		if !HasPermissionToChannelContext(c, channelId, model.PERMISSION_USE_SLASH_COMMANDS) {
+			return
+		}
+	}
+
+	parts := strings.Split(command, " ")
+	trigger := parts[0][1:]
+	trigger = strings.ToLower(trigger)
+	message := strings.Join(parts[1:], " ")
+	provider := GetCommandProvider(trigger)
+
+	if provider != nil {
+		response := provider.DoCommand(c, channelId, message)
+		handleResponse(c, w, response, channelId, provider.GetCommand(c), true)
+		return
+	} else {
+
+		if !*utils.Cfg.ServiceSettings.EnableCommands {
+			c.Err = model.NewLocAppError("executeCommand", "api.command.disabled.app_error", nil, "")
+			c.Err.StatusCode = http.StatusNotImplemented
+			return
+		}
+
+		chanChan := Srv.Store.Channel().Get(channelId)
+		teamChan := Srv.Store.Team().Get(c.TeamId)
+		userChan := Srv.Store.User().Get(c.Session.UserId)
+
+		if result := <-Srv.Store.Command().GetByTeam(c.TeamId); result.Err != nil {
+			c.Err = result.Err
+			return
+		} else {
+
+			var team *model.Team
+			if tr := <-teamChan; tr.Err != nil {
+				c.Err = tr.Err
+				return
+			} else {
+				team = tr.Data.(*model.Team)
+
+			}
+
+			var user *model.User
+			if ur := <-userChan; ur.Err != nil {
+				c.Err = ur.Err
+				return
+			} else {
+				user = ur.Data.(*model.User)
+			}
+
+			var channel *model.Channel
+			if cr := <-chanChan; cr.Err != nil {
+				c.Err = cr.Err
+				return
+			} else {
+				channel = cr.Data.(*model.Channel)
+			}
+
+			teamCmds := result.Data.([]*model.Command)
+			for _, cmd := range teamCmds {
+				if trigger == cmd.Trigger {
+					l4g.Debug(fmt.Sprintf(utils.T("api.command.execute_command.debug"), trigger, c.Session.UserId))
+
+					p := url.Values{}
+					p.Set("token", cmd.Token)
+
+					p.Set("team_id", cmd.TeamId)
+					p.Set("team_domain", team.Name)
+
+					p.Set("channel_id", channelId)
+					p.Set("channel_name", channel.Name)
+
+					p.Set("user_id", c.Session.UserId)
+					p.Set("user_name", user.Username)
+
+					p.Set("command", "/"+trigger)
+					p.Set("text", message)
+					p.Set("response_url", "not supported yet")
+
+					method := "POST"
+					if cmd.Method == model.COMMAND_METHOD_GET {
+						method = "GET"
+					}
+
+					tr := &http.Transport{
+						TLSClientConfig: &tls.Config{InsecureSkipVerify: *utils.Cfg.ServiceSettings.EnableInsecureOutgoingConnections},
+					}
+					client := &http.Client{Transport: tr}
+
+					req, _ := http.NewRequest(method, cmd.URL, strings.NewReader(p.Encode()))
+					req.Header.Set("Accept", "application/json")
+					if cmd.Method == model.COMMAND_METHOD_POST {
+						req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					}
+
+					if resp, err := client.Do(req); err != nil {
+						c.Err = model.NewLocAppError("command", "api.command.execute_command.failed.app_error", map[string]interface{}{"Trigger": trigger}, err.Error())
+					} else {
+						if resp.StatusCode == http.StatusOK {
+							response := model.CommandResponseFromJson(resp.Body)
+							if response == nil {
+								c.Err = model.NewLocAppError("command", "api.command.execute_command.failed_empty.app_error", map[string]interface{}{"Trigger": trigger}, "")
+							} else {
+								handleResponse(c, w, response, channelId, cmd, false)
+							}
+						} else {
+							defer resp.Body.Close()
+							body, _ := ioutil.ReadAll(resp.Body)
+							c.Err = model.NewLocAppError("command", "api.command.execute_command.failed_resp.app_error", map[string]interface{}{"Trigger": trigger, "Status": resp.Status}, string(body))
+						}
+					}
+
+					return
+				}
+			}
+
+		}
+	}
+
+	c.Err = model.NewLocAppError("command", "api.command.execute_command.not_found.app_error", map[string]interface{}{"Trigger": trigger}, "")
+}
+
+func handleResponse(c *Context, w http.ResponseWriter, response *model.CommandResponse, channelId string, cmd *model.Command, builtIn bool) {
+
+	post := &model.Post{}
+	post.ChannelId = channelId
+
+	if !builtIn {
+		post.AddProp("from_webhook", "true")
+	}
+
+	if utils.Cfg.ServiceSettings.EnablePostUsernameOverride {
+		if len(cmd.Username) != 0 {
+			post.AddProp("override_username", cmd.Username)
+		} else {
+			post.AddProp("override_username", model.DEFAULT_WEBHOOK_USERNAME)
+		}
+	}
+
+	if utils.Cfg.ServiceSettings.EnablePostIconOverride {
+		if len(cmd.IconURL) != 0 {
+			post.AddProp("override_icon_url", cmd.IconURL)
+		} else {
+			post.AddProp("override_icon_url", "")
+		}
+	}
+
+	if response.ResponseType == model.COMMAND_RESPONSE_TYPE_IN_CHANNEL {
+		post.Message = response.Text
+		post.UserId = c.Session.UserId
+		if _, err := CreatePost(c, post, true); err != nil {
+			c.Err = model.NewLocAppError("command", "api.command.execute_command.save.app_error", nil, "")
+		}
+	} else if response.ResponseType == model.COMMAND_RESPONSE_TYPE_EPHEMERAL && response.Text != "" {
+		post.Message = response.Text
+		post.CreateAt = model.GetMillis()
+		post.UserId = c.Session.UserId
+		SendEphemeralPost(
+			c.TeamId,
+			c.Session.UserId,
+			post,
+		)
+	}
+
+	w.Write([]byte(response.ToJson()))
+}
+
+func createCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !*utils.Cfg.ServiceSettings.EnableCommands {
+		c.Err = model.NewLocAppError("createCommand", "api.command.disabled.app_error", nil, "")
+		c.Err.StatusCode = http.StatusNotImplemented
+		return
+	}
+
+	if !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.Err = model.NewLocAppError("createCommand", "api.command.admin_only.app_error", nil, "")
+		c.Err.StatusCode = http.StatusForbidden
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	cmd := model.CommandFromJson(r.Body)
+
+	if cmd == nil {
+		c.SetInvalidParam("createCommand", "command")
+		return
+	}
+
+	cmd.Trigger = strings.ToLower(cmd.Trigger)
+	cmd.CreatorId = c.Session.UserId
+	cmd.TeamId = c.TeamId
+
+	if result := <-Srv.Store.Command().GetByTeam(c.TeamId); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		teamCmds := result.Data.([]*model.Command)
+		for _, existingCommand := range teamCmds {
+			if cmd.Trigger == existingCommand.Trigger {
+				c.Err = model.NewLocAppError("createCommand", "api.command.duplicate_trigger.app_error", nil, "")
+				return
+			}
+		}
+		for _, builtInProvider := range commandProviders {
+			builtInCommand := *builtInProvider.GetCommand(c)
+			if cmd.Trigger == builtInCommand.Trigger {
+				c.Err = model.NewLocAppError("createCommand", "api.command.duplicate_trigger.app_error", nil, "")
+				return
+			}
+		}
+	}
+
+	if result := <-Srv.Store.Command().Save(cmd); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		c.LogAudit("success")
+		rcmd := result.Data.(*model.Command)
+		w.Write([]byte(rcmd.ToJson()))
+	}
+}
+
+func updateCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !*utils.Cfg.ServiceSettings.EnableCommands {
+		c.Err = model.NewLocAppError("updateCommand", "api.command.disabled.app_error", nil, "")
+		c.Err.StatusCode = http.StatusNotImplemented
+		return
+	}
+
+	if !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.Err = model.NewLocAppError("updateCommand", "api.command.admin_only.app_error", nil, "")
+		c.Err.StatusCode = http.StatusForbidden
+		return
+	}
+
+	c.LogAudit("attempt")
+
+	cmd := model.CommandFromJson(r.Body)
+
+	if cmd == nil {
+		c.SetInvalidParam("updateCommand", "command")
+		return
+	}
+
+	cmd.Trigger = strings.ToLower(cmd.Trigger)
+
+	var oldCmd *model.Command
+	if result := <-Srv.Store.Command().Get(cmd.Id); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		oldCmd = result.Data.(*model.Command)
+
+		if c.Session.UserId != oldCmd.CreatorId && !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS) {
+			c.LogAudit("fail - inappropriate permissions")
+			c.Err = model.NewLocAppError("updateCommand", "api.command.update.app_error", nil, "user_id="+c.Session.UserId)
+			return
+		}
+
+		if c.TeamId != oldCmd.TeamId {
+			c.Err = model.NewLocAppError("updateCommand", "api.command.team_mismatch.app_error", nil, "user_id="+c.Session.UserId)
+			return
+		}
+
+		cmd.Id = oldCmd.Id
+		cmd.Token = oldCmd.Token
+		cmd.CreateAt = oldCmd.CreateAt
+		cmd.UpdateAt = model.GetMillis()
+		cmd.DeleteAt = oldCmd.DeleteAt
+		cmd.CreatorId = oldCmd.CreatorId
+		cmd.TeamId = oldCmd.TeamId
+	}
+
+	if result := <-Srv.Store.Command().Update(cmd); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		w.Write([]byte(result.Data.(*model.Command).ToJson()))
+	}
+}
+
+func listTeamCommands(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !*utils.Cfg.ServiceSettings.EnableCommands {
+		c.Err = model.NewLocAppError("listTeamCommands", "api.command.disabled.app_error", nil, "")
+		c.Err.StatusCode = http.StatusNotImplemented
+		return
+	}
+
+	if !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.Err = model.NewLocAppError("listTeamCommands", "api.command.admin_only.app_error", nil, "")
+		c.Err.StatusCode = http.StatusForbidden
+		return
+	}
+
+	if result := <-Srv.Store.Command().GetByTeam(c.TeamId); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		cmds := result.Data.([]*model.Command)
+		w.Write([]byte(model.CommandListToJson(cmds)))
+	}
+}
+
+func regenCommandToken(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !*utils.Cfg.ServiceSettings.EnableCommands {
+		c.Err = model.NewLocAppError("regenCommandToken", "api.command.disabled.app_error", nil, "")
+		c.Err.StatusCode = http.StatusNotImplemented
+		return
+	}
+
+	if !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.Err = model.NewLocAppError("regenCommandToken", "api.command.admin_only.app_error", nil, "")
+		c.Err.StatusCode = http.StatusForbidden
+		return
+	}
+
+	c.LogAudit("attempt")
 
 	props := model.MapFromJson(r.Body)
 
-	command := &model.Command{
-		Command:     strings.TrimSpace(props["command"]),
-		ChannelId:   strings.TrimSpace(props["channelId"]),
-		Suggest:     props["suggest"] == "true",
-		Suggestions: make([]*model.SuggestCommand, 0, 128),
+	id := props["id"]
+	if len(id) == 0 {
+		c.SetInvalidParam("regenCommandToken", "id")
+		return
 	}
 
-	checkCommand(c, command)
-
-	if c.Err != nil {
+	var cmd *model.Command
+	if result := <-Srv.Store.Command().Get(id); result.Err != nil {
+		c.Err = result.Err
 		return
 	} else {
-		w.Write([]byte(command.ToJson()))
+		cmd = result.Data.(*model.Command)
+
+		if c.TeamId != cmd.TeamId || (c.Session.UserId != cmd.CreatorId && !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS)) {
+			c.LogAudit("fail - inappropriate permissions")
+			c.Err = model.NewLocAppError("regenToken", "api.command.regen.app_error", nil, "user_id="+c.Session.UserId)
+			return
+		}
+	}
+
+	cmd.Token = model.NewId()
+
+	if result := <-Srv.Store.Command().Update(cmd); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		w.Write([]byte(result.Data.(*model.Command).ToJson()))
 	}
 }
 
-func checkCommand(c *Context, command *model.Command) bool {
-
-	if len(command.Command) == 0 || strings.Index(command.Command, "/") != 0 {
-		c.Err = model.NewAppError("checkCommand", "Command must start with /", "")
-		return false
+func deleteCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	if !*utils.Cfg.ServiceSettings.EnableCommands {
+		c.Err = model.NewLocAppError("deleteCommand", "api.command.disabled.app_error", nil, "")
+		c.Err.StatusCode = http.StatusNotImplemented
+		return
 	}
 
-	if len(command.ChannelId) > 0 {
-		cchan := Srv.Store.Channel().CheckPermissionsTo(c.Session.TeamId, command.ChannelId, c.Session.UserId)
+	if !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_SLASH_COMMANDS) {
+		c.Err = model.NewLocAppError("deleteCommand", "api.command.admin_only.app_error", nil, "")
+		c.Err.StatusCode = http.StatusForbidden
+		return
+	}
 
-		if !c.HasPermissionsToChannel(cchan, "checkCommand") {
-			return true
+	c.LogAudit("attempt")
+
+	props := model.MapFromJson(r.Body)
+
+	id := props["id"]
+	if len(id) == 0 {
+		c.SetInvalidParam("deleteCommand", "id")
+		return
+	}
+
+	if result := <-Srv.Store.Command().Get(id); result.Err != nil {
+		c.Err = result.Err
+		return
+	} else {
+		if c.TeamId != result.Data.(*model.Command).TeamId || (c.Session.UserId != result.Data.(*model.Command).CreatorId && !HasPermissionToCurrentTeamContext(c, model.PERMISSION_MANAGE_OTHERS_SLASH_COMMANDS)) {
+			c.LogAudit("fail - inappropriate permissions")
+			c.Err = model.NewLocAppError("deleteCommand", "api.command.delete.app_error", nil, "user_id="+c.Session.UserId)
+			return
 		}
 	}
 
-	for _, v := range commands {
-		if v(c, command) {
-			return true
-		} else if c.Err != nil {
-			return true
-		}
+	if err := (<-Srv.Store.Command().Delete(id, model.GetMillis())).Err; err != nil {
+		c.Err = err
+		return
 	}
 
-	return false
+	c.LogAudit("success")
+	w.Write([]byte(model.MapToJson(props)))
 }
 
-func logoutCommand(c *Context, command *model.Command) bool {
+func testCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
 
-	cmd := "/logout"
-
-	if strings.Index(command.Command, cmd) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Logout"})
-
-		if !command.Suggest {
-			command.GotoLocation = "/logout"
-			command.Response = model.RESP_EXECUTED
-			return true
-		}
-
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Logout"})
+	msg := ""
+	if r.Method == "POST" {
+		msg = msg + "\ntoken=" + r.FormValue("token")
+		msg = msg + "\nteam_domain=" + r.FormValue("team_domain")
+	} else {
+		body, _ := ioutil.ReadAll(r.Body)
+		msg = string(body)
 	}
 
-	return false
+	rc := &model.CommandResponse{
+		Text:         "test command response " + msg,
+		ResponseType: model.COMMAND_RESPONSE_TYPE_IN_CHANNEL,
+	}
+
+	w.Write([]byte(rc.ToJson()))
 }
 
-func echoCommand(c *Context, command *model.Command) bool {
+func testEphemeralCommand(c *Context, w http.ResponseWriter, r *http.Request) {
+	r.ParseForm()
 
-	cmd := "/echo"
-
-	if strings.Index(command.Command, cmd) == 0 {
-		parts := strings.SplitN(command.Command, " ", 3)
-
-		channelName := ""
-		if len(parts) >= 2 {
-			channelName = parts[1]
-		}
-
-		message := ""
-		if len(parts) >= 3 {
-			message = parts[2]
-		}
-
-		if result := <-Srv.Store.Channel().GetChannels(c.Session.TeamId, c.Session.UserId); result.Err != nil {
-			c.Err = result.Err
-			return false
-		} else {
-			channels := result.Data.(*model.ChannelList)
-
-			for _, v := range channels.Channels {
-				if v.Type == model.CHANNEL_DIRECT {
-					continue
-				}
-
-				if v.Name == channelName && !command.Suggest {
-					post := &model.Post{}
-					post.ChannelId = v.Id
-					post.Message = message
-
-					if _, err := CreateValetPost(c, post); err != nil {
-						c.Err = err
-						return false
-					}
-
-					command.Response = model.RESP_EXECUTED
-					return true
-				}
-
-				if len(channelName) == 0 || (strings.Index(v.Name, channelName) == 0 && len(parts) < 3) {
-					command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd + " " + v.Name, Description: "Echo a message using Valet in a channel"})
-				}
-			}
-		}
-
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Echo a message using Valet in a channel"})
+	msg := ""
+	if r.Method == "POST" {
+		msg = msg + "\ntoken=" + r.FormValue("token")
+		msg = msg + "\nteam_domain=" + r.FormValue("team_domain")
+	} else {
+		body, _ := ioutil.ReadAll(r.Body)
+		msg = string(body)
 	}
 
-	return false
-}
-
-func joinCommand(c *Context, command *model.Command) bool {
-
-	// looks for "/join channel-name"
-	cmd := "/join"
-
-	if strings.Index(command.Command, cmd) == 0 {
-
-		parts := strings.Split(command.Command, " ")
-
-		startsWith := ""
-
-		if len(parts) == 2 {
-			startsWith = parts[1]
-		}
-
-		if result := <-Srv.Store.Channel().GetMoreChannels(c.Session.TeamId, c.Session.UserId); result.Err != nil {
-			c.Err = result.Err
-			return false
-		} else {
-			channels := result.Data.(*model.ChannelList)
-
-			for _, v := range channels.Channels {
-
-				if v.Name == startsWith && !command.Suggest {
-
-					if v.Type == model.CHANNEL_DIRECT {
-						return false
-					}
-
-					JoinChannel(c, v.Id, "/command")
-
-					if c.Err != nil {
-						return false
-					}
-
-					command.GotoLocation = "/channels/" + v.Name
-					command.Response = model.RESP_EXECUTED
-					return true
-				}
-
-				if len(startsWith) == 0 || strings.Index(v.Name, startsWith) == 0 {
-					command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd + " " + v.Name, Description: "Join the open channel"})
-				}
-			}
-		}
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Join an open channel"})
+	rc := &model.CommandResponse{
+		Text:         "test command response " + msg,
+		ResponseType: model.COMMAND_RESPONSE_TYPE_EPHEMERAL,
 	}
 
-	return false
-}
-
-func loadTestCommand(c *Context, command *model.Command) bool {
-	cmd := "/loadtest"
-
-	// This command is only available when AllowTesting is true
-	if !utils.Cfg.ServiceSettings.AllowTesting {
-		return false
-	}
-
-	if strings.Index(command.Command, cmd) == 0 {
-		if loadTestSetupCommand(c, command) {
-			return true
-		}
-		if loadTestUsersCommand(c, command) {
-			return true
-		}
-		if loadTestChannelsCommand(c, command) {
-			return true
-		}
-		if loadTestPostsCommand(c, command) {
-			return true
-		}
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd, Description: "Debug Load Testing"})
-	}
-
-	return false
-}
-
-func parseRange(command string, cmd string) (utils.Range, bool) {
-	tokens := strings.Fields(strings.TrimPrefix(command, cmd))
-	var begin int
-	var end int
-	var err1 error
-	var err2 error
-	switch {
-	case len(tokens) == 1:
-		begin, err1 = strconv.Atoi(tokens[0])
-		end = begin
-		if err1 != nil {
-			return utils.Range{0, 0}, false
-		}
-	case len(tokens) >= 2:
-		begin, err1 = strconv.Atoi(tokens[0])
-		end, err2 = strconv.Atoi(tokens[1])
-		if err1 != nil || err2 != nil {
-			return utils.Range{0, 0}, false
-		}
-	default:
-		return utils.Range{0, 0}, false
-	}
-	return utils.Range{begin, end}, true
-}
-
-func contains(items []string, token string) bool {
-	for _, elem := range items {
-		if elem == token {
-			return true
-		}
-	}
-	return false
-}
-
-func loadTestSetupCommand(c *Context, command *model.Command) bool {
-	cmd := "/loadtest setup"
-
-	if strings.Index(command.Command, cmd) == 0 && !command.Suggest {
-		tokens := strings.Fields(strings.TrimPrefix(command.Command, cmd))
-		doTeams := contains(tokens, "teams")
-		doFuzz := contains(tokens, "fuzz")
-
-		numArgs := 0
-		if doTeams {
-			numArgs++
-		}
-		if doFuzz {
-			numArgs++
-		}
-
-		var numTeams int
-		var numChannels int
-		var numUsers int
-		var numPosts int
-
-		// Defaults
-		numTeams = 10
-		numChannels = 10
-		numUsers = 10
-		numPosts = 10
-
-		if doTeams {
-			if (len(tokens) - numArgs) >= 4 {
-				numTeams, _ = strconv.Atoi(tokens[numArgs+0])
-				numChannels, _ = strconv.Atoi(tokens[numArgs+1])
-				numUsers, _ = strconv.Atoi(tokens[numArgs+2])
-				numPosts, _ = strconv.Atoi(tokens[numArgs+3])
-			}
-		} else {
-			if (len(tokens) - numArgs) >= 3 {
-				numChannels, _ = strconv.Atoi(tokens[numArgs+0])
-				numUsers, _ = strconv.Atoi(tokens[numArgs+1])
-				numPosts, _ = strconv.Atoi(tokens[numArgs+2])
-			}
-		}
-		client := model.NewClient(c.TeamUrl + "/api/v1")
-
-		if doTeams {
-			if err := CreateBasicUser(client); err != nil {
-				l4g.Error("Failed to create testing enviroment")
-				return true
-			}
-			client.LoginByEmail(BTEST_TEAM_DOMAIN_NAME, BTEST_USER_EMAIL, BTEST_USER_PASSWORD)
-			enviroment, err := CreateTestEnviromentWithTeams(
-				client,
-				utils.Range{numTeams, numTeams},
-				utils.Range{numChannels, numChannels},
-				utils.Range{numUsers, numUsers},
-				utils.Range{numPosts, numPosts},
-				doFuzz)
-			if err != true {
-				l4g.Error("Failed to create testing enviroment")
-				return true
-			} else {
-				l4g.Info("Testing enviroment created")
-				for i := 0; i < len(enviroment.Teams); i++ {
-					l4g.Info("Team Created: " + enviroment.Teams[i].Domain)
-					l4g.Info("\t User to login: " + enviroment.Enviroments[i].Users[0].Email + ", " + USER_PASSWORD)
-				}
-			}
-		} else {
-			client.MockSession(c.Session.Id)
-			CreateTestEnviromentInTeam(
-				client,
-				c.Session.TeamId,
-				utils.Range{numChannels, numChannels},
-				utils.Range{numUsers, numUsers},
-				utils.Range{numPosts, numPosts},
-				doFuzz)
-		}
-		return true
-	} else if strings.Index(cmd, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{
-			Suggestion:  cmd,
-			Description: "Creates a testing enviroment in current team. [teams] [fuzz] <Num Channels> <Num Users> <NumPosts>"})
-	}
-
-	return false
-}
-
-func loadTestUsersCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest users"
-	cmd2 := "/loadtest users fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			doFuzz = true
-			cmd = cmd2
-		}
-		usersr, err := parseRange(command.Command, cmd)
-		if err == false {
-			usersr = utils.Range{10, 15}
-		}
-		client := model.NewClient(c.TeamUrl + "/api/v1")
-		userCreator := NewAutoUserCreator(client, c.Session.TeamId)
-		userCreator.Fuzzy = doFuzz
-		userCreator.CreateTestUsers(usersr)
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add a specified number of random users to current team <Min Users> <Max Users>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random users with fuzz text to current team <Min Users> <Max Users>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random users with fuzz text to current team <Min Users> <Max Users>"})
-	}
-
-	return false
-}
-
-func loadTestChannelsCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest channels"
-	cmd2 := "/loadtest channels fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			doFuzz = true
-			cmd = cmd2
-		}
-		channelsr, err := parseRange(command.Command, cmd)
-		if err == false {
-			channelsr = utils.Range{20, 30}
-		}
-		client := model.NewClient(c.TeamUrl + "/api/v1")
-		client.MockSession(c.Session.Id)
-		channelCreator := NewAutoChannelCreator(client, c.Session.TeamId)
-		channelCreator.Fuzzy = doFuzz
-		channelCreator.CreateTestChannels(channelsr)
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add a specified number of random channels to current team <MinChannels> <MaxChannels>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random channels with fuzz text to current team <Min Channels> <Max Channels>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add a specified number of random channels with fuzz text to current team <Min Channels> <Max Channels>"})
-	}
-
-	return false
-}
-
-func loadTestPostsCommand(c *Context, command *model.Command) bool {
-	cmd1 := "/loadtest posts"
-	cmd2 := "/loadtest posts fuzz"
-
-	if strings.Index(command.Command, cmd1) == 0 && !command.Suggest {
-		cmd := cmd1
-		doFuzz := false
-		if strings.Index(command.Command, cmd2) == 0 {
-			cmd = cmd2
-			doFuzz = true
-		}
-
-		postsr, err := parseRange(command.Command, cmd)
-		if err == false {
-			postsr = utils.Range{20, 30}
-		}
-
-		tokens := strings.Fields(strings.TrimPrefix(command.Command, cmd))
-		rimages := utils.Range{0, 0}
-		if len(tokens) >= 3 {
-			if numImages, err := strconv.Atoi(tokens[2]); err == nil {
-				rimages = utils.Range{numImages, numImages}
-			}
-		}
-
-		var usernames []string
-		if result := <-Srv.Store.User().GetProfiles(c.Session.TeamId); result.Err == nil {
-			profileUsers := result.Data.(map[string]*model.User)
-			usernames = make([]string, len(profileUsers))
-			i := 0
-			for _, userprof := range profileUsers {
-				usernames[i] = userprof.Username
-				i++
-			}
-		}
-
-		client := model.NewClient(c.TeamUrl + "/api/v1")
-		client.MockSession(c.Session.Id)
-		testPoster := NewAutoPostCreator(client, command.ChannelId)
-		testPoster.Fuzzy = doFuzz
-		testPoster.Users = usernames
-
-		numImages := utils.RandIntFromRange(rimages)
-		numPosts := utils.RandIntFromRange(postsr)
-		for i := 0; i < numPosts; i++ {
-			testPoster.HasImage = (i < numImages)
-			testPoster.CreateRandomPost()
-		}
-		return true
-	} else if strings.Index(cmd1, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd1, Description: "Add some random posts to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add some random posts with fuzz text to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-	} else if strings.Index(cmd2, command.Command) == 0 {
-		command.AddSuggestion(&model.SuggestCommand{Suggestion: cmd2, Description: "Add some random posts with fuzz text to current channel <Min Posts> <Max Posts> <Min Images> <Max Images>"})
-	}
-
-	return false
+	w.Write([]byte(rc.ToJson()))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -52,6 +52,15 @@ func (o *PostList) AddPost(post *Post) {
 	}
 
 	o.Posts[post.Id] = post
+}
+
+func (o *PostList) Extend(other *PostList) {
+	for _, postId := range other.Order {
+		if _, ok := o.Posts[postId]; !ok {
+			o.AddPost(other.Posts[postId])
+			o.AddOrder(postId)
+		}
+	}
 }
 
 func (o *PostList) Etag() string {

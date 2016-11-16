@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
@@ -8,7 +8,7 @@ import (
 	"github.com/mattermost/platform/utils"
 )
 
-type TeamEnviroment struct {
+type TeamEnvironment struct {
 	Users    []*model.User
 	Channels []*model.Channel
 }
@@ -39,22 +39,22 @@ func NewAutoTeamCreator(client *model.Client) *AutoTeamCreator {
 
 func (cfg *AutoTeamCreator) createRandomTeam() (*model.Team, bool) {
 	var teamEmail string
+	var teamDisplayName string
 	var teamName string
-	var teamDomain string
 	if cfg.Fuzzy {
-		teamEmail = utils.FuzzEmail()
+		teamEmail = "success+" + model.NewId() + "simulator.amazonses.com"
+		teamDisplayName = utils.FuzzName()
 		teamName = utils.FuzzName()
-		teamDomain = utils.FuzzName()
 	} else {
-		teamEmail = utils.RandomEmail(cfg.EmailLength, cfg.EmailCharset)
-		teamName = utils.RandomName(cfg.NameLength, cfg.NameCharset)
-		teamDomain = utils.RandomName(cfg.NameLength, cfg.NameCharset) + model.NewId()
+		teamEmail = "success+" + model.NewId() + "simulator.amazonses.com"
+		teamDisplayName = utils.RandomName(cfg.NameLength, cfg.NameCharset)
+		teamName = utils.RandomName(cfg.NameLength, cfg.NameCharset) + model.NewId()
 	}
 	team := &model.Team{
-		Name:   teamName,
-		Domain: teamDomain,
-		Email:  teamEmail,
-		Type:   model.TEAM_OPEN,
+		DisplayName: teamDisplayName,
+		Name:        teamName,
+		Email:       teamEmail,
+		Type:        model.TEAM_OPEN,
 	}
 
 	result, err := cfg.client.CreateTeam(team)

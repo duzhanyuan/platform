@@ -1,28 +1,27 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package api
 
 import (
-	"github.com/mattermost/platform/model"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/mattermost/platform/model"
+	"github.com/mattermost/platform/utils"
 )
 
 func TestCreateChannel(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	team2 := &model.Team{Name: "Name Team 2", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team2 = Client.Must(Client.CreateTeam(team2)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+	th := Setup().InitBasic().InitSystemAdmin()
+	Client := th.BasicClient
+	SystemAdminClient := th.SystemAdminClient
+	team := th.BasicTeam
+	Client.Must(Client.Logout())
+	team2 := th.CreateTeam(th.BasicClient)
+	th.LoginBasic()
+	th.BasicClient.SetTeamId(team.Id)
 
 	channel := model.Channel{DisplayName: "Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	rchannel, err := Client.CreateChannel(&channel)
@@ -35,28 +34,50 @@ func TestCreateChannel(t *testing.T) {
 	}
 
 	rget := Client.Must(Client.GetChannels("")).Data.(*model.ChannelList)
-	if rget.Channels[0].Name != channel.Name {
-		t.Fatal("full name didn't match")
+	nameMatch := false
+	for _, c := range *rget {
+		if c.Name == channel.Name {
+			nameMatch = true
+		}
+	}
+
+	if !nameMatch {
+		t.Fatal("Did not create channel with correct name")
 	}
 
 	if _, err := Client.CreateChannel(rchannel.Data.(*model.Channel)); err == nil {
 		t.Fatal("Cannot create an existing")
 	}
 
+	savedId := rchannel.Data.(*model.Channel).Id
+
 	rchannel.Data.(*model.Channel).Id = ""
 	if _, err := Client.CreateChannel(rchannel.Data.(*model.Channel)); err != nil {
-		if err.Message != "A channel with that name already exists" {
+		if err.Message != "A channel with that URL already exists" {
 			t.Fatal(err)
 		}
 	}
 
-	if _, err := Client.DoPost("/channels/create", "garbage"); err == nil {
+	if _, err := Client.DoApiPost(Client.GetTeamRoute()+"/channels/create", "garbage"); err == nil {
 		t.Fatal("should have been an error")
+	}
+
+	Client.DeleteChannel(savedId)
+	if _, err := Client.CreateChannel(rchannel.Data.(*model.Channel)); err != nil {
+		if err.Message != "A channel with that URL was previously created" {
+			t.Fatal(err)
+		}
 	}
 
 	channel = model.Channel{DisplayName: "Channel on Different Team", Name: "aaaa" + model.NewId() + "abbb", Type: model.CHANNEL_OPEN, TeamId: team2.Id}
 
 	if _, err := Client.CreateChannel(&channel); err.StatusCode != http.StatusForbidden {
+		t.Fatal(err)
+	}
+
+	channel = model.Channel{DisplayName: "Channel With No TeamId", Name: "aaaa" + model.NewId() + "abbb", Type: model.CHANNEL_OPEN, TeamId: ""}
+
+	if _, err := Client.CreateChannel(&channel); err != nil {
 		t.Fatal(err)
 	}
 
@@ -71,28 +92,85 @@ func TestCreateChannel(t *testing.T) {
 	if _, err := Client.CreateChannel(&channel); err == nil {
 		t.Fatal("Should have errored out on direct channel type")
 	}
+
+	isLicensed := utils.IsLicensed
+	restrictPublicChannel := *utils.Cfg.TeamSettings.RestrictPublicChannelManagement
+	restrictPrivateChannel := *utils.Cfg.TeamSettings.RestrictPrivateChannelManagement
+	defer func() {
+		*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = restrictPublicChannel
+		*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = restrictPrivateChannel
+		utils.IsLicensed = isLicensed
+		utils.SetDefaultRolesBasedOnConfig()
+	}()
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_ALL
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_ALL
+	utils.SetDefaultRolesBasedOnConfig()
+	utils.IsLicensed = true
+
+	channel2 := &model.Channel{DisplayName: "Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel3 := &model.Channel{DisplayName: "Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_PRIVATE, TeamId: team.Id}
+	if _, err := Client.CreateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.CreateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	channel2.Name = "a" + model.NewId() + "a"
+	channel3.Name = "a" + model.NewId() + "a"
+	if _, err := Client.CreateChannel(channel2); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+	if _, err := Client.CreateChannel(channel3); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+
+	UpdateUserToTeamAdmin(th.BasicUser, team)
+	Client.Logout()
+	th.LoginBasic()
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.CreateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.CreateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	channel2.Name = "a" + model.NewId() + "a"
+	channel3.Name = "a" + model.NewId() + "a"
+	if _, err := Client.CreateChannel(channel2); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+	if _, err := Client.CreateChannel(channel3); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+
+	LinkUserToTeam(th.SystemAdminUser, team)
+
+	if _, err := SystemAdminClient.CreateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SystemAdminClient.CreateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestCreateDirectChannel(t *testing.T) {
-	Setup()
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	user := th.BasicUser
+	user2 := th.BasicUser2
 
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
-
-	data := make(map[string]string)
-	data["user_id"] = user2.Id
-
-	rchannel, err := Client.CreateDirectChannel(data)
+	rchannel, err := Client.CreateDirectChannel(th.BasicUser2.Id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,166 +190,464 @@ func TestCreateDirectChannel(t *testing.T) {
 		t.Fatal("channel type was not direct")
 	}
 
-	if _, err := Client.CreateDirectChannel(data); err == nil {
-		t.Fatal("channel already exists and should have failed")
+	// don't fail on direct channels already existing
+	if _, err := Client.CreateDirectChannel(th.BasicUser2.Id); err != nil {
+		t.Fatal(err)
 	}
 
-	data["user_id"] = "junk"
-	if _, err := Client.CreateDirectChannel(data); err == nil {
+	if _, err := Client.CreateDirectChannel("junk"); err == nil {
 		t.Fatal("should have failed with bad user id")
 	}
 
-	data["user_id"] = "12345678901234567890123456"
-	if _, err := Client.CreateDirectChannel(data); err == nil {
+	if _, err := Client.CreateDirectChannel("12345678901234567890123456"); err == nil {
 		t.Fatal("should have failed with non-existent user")
 	}
 
 }
 
 func TestUpdateChannel(t *testing.T) {
-	Setup()
+	th := Setup().InitBasic().InitSystemAdmin()
+	Client := th.SystemAdminClient
+	team := th.SystemAdminTeam
+	sysAdminUser := th.SystemAdminUser
+	user := th.CreateUser(Client)
+	LinkUserToTeam(user, team)
+	user2 := th.CreateUser(Client)
+	LinkUserToTeam(user2, team)
 
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	userTeamAdmin := &model.User{TeamId: team.Id, Email: team.Email, FullName: "Corey Hulen", Password: "pwd"}
-	userTeamAdmin = Client.Must(Client.CreateUser(userTeamAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userTeamAdmin.Id)
-
-	userChannelAdmin := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userChannelAdmin = Client.Must(Client.CreateUser(userChannelAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userChannelAdmin.Id)
-
-	userStd := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userStd = Client.Must(Client.CreateUser(userStd, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userStd.Id)
-	userStd.Roles = ""
-
-	Client.LoginByEmail(team.Domain, userChannelAdmin.Email, "pwd")
+	Client.Login(user.Email, user.Password)
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
 
-	Client.AddChannelMember(channel1.Id, userTeamAdmin.Id)
+	Client.AddChannelMember(channel1.Id, user.Id)
 
-	desc := "a" + model.NewId() + "a"
-	upChannel1 := &model.Channel{Id: channel1.Id, Description: desc}
+	header := "a" + model.NewId() + "a"
+	purpose := "a" + model.NewId() + "a"
+	upChannel1 := &model.Channel{Id: channel1.Id, Header: header, Purpose: purpose}
 	upChannel1 = Client.Must(Client.UpdateChannel(upChannel1)).Data.(*model.Channel)
 
-	if upChannel1.Description != desc {
-		t.Fatal("Channel admin failed to update desc")
+	if upChannel1.Header != header {
+		t.Fatal("Channel admin failed to update header")
+	}
+
+	if upChannel1.Purpose != purpose {
+		t.Fatal("Channel admin failed to update purpose")
 	}
 
 	if upChannel1.DisplayName != channel1.DisplayName {
 		t.Fatal("Channel admin failed to skip displayName")
 	}
 
-	Client.LoginByEmail(team.Domain, userTeamAdmin.Email, "pwd")
-
-	desc = "b" + model.NewId() + "b"
-	upChannel1 = &model.Channel{Id: channel1.Id, Description: desc}
-	upChannel1 = Client.Must(Client.UpdateChannel(upChannel1)).Data.(*model.Channel)
-
-	if upChannel1.Description != desc {
-		t.Fatal("Team admin failed to update desc")
-	}
-
-	if upChannel1.DisplayName != channel1.DisplayName {
-		t.Fatal("Team admin failed to skip displayName")
-	}
-
 	rget := Client.Must(Client.GetChannels(""))
-	data := rget.Data.(*model.ChannelList)
-	for _, c := range data.Channels {
+	channels := rget.Data.(*model.ChannelList)
+	for _, c := range *channels {
 		if c.Name == model.DEFAULT_CHANNEL {
-			c.Description = "new desc"
+			c.Header = "new header"
+			c.Name = "pseudo-square"
 			if _, err := Client.UpdateChannel(c); err == nil {
-				t.Fatal("should have errored on updating default channel")
+				t.Fatal("should have errored on updating default channel name")
 			}
 			break
 		}
 	}
 
-	Client.LoginByEmail(team.Domain, userStd.Email, "pwd")
+	Client.Login(user2.Email, user2.Password)
 
 	if _, err := Client.UpdateChannel(upChannel1); err == nil {
 		t.Fatal("Standard User should have failed to update")
 	}
+
+	Client.Must(Client.JoinChannel(channel1.Id))
+	UpdateUserToTeamAdmin(user2, team)
+
+	Client.Logout()
+	Client.Login(user2.Email, user2.Password)
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.UpdateChannel(upChannel1); err != nil {
+		t.Fatal(err)
+	}
+
+	Client.Login(sysAdminUser.Email, sysAdminUser.Password)
+	LinkUserToTeam(sysAdminUser, team)
+	Client.Must(Client.JoinChannel(channel1.Id))
+
+	if _, err := Client.UpdateChannel(upChannel1); err != nil {
+		t.Fatal(err)
+	}
+
+	Client.Must(Client.DeleteChannel(channel1.Id))
+
+	if _, err := Client.UpdateChannel(upChannel1); err == nil {
+		t.Fatal("should have failed - channel deleted")
+	}
+
+	isLicensed := utils.IsLicensed
+	restrictPublicChannel := *utils.Cfg.TeamSettings.RestrictPublicChannelManagement
+	restrictPrivateChannel := *utils.Cfg.TeamSettings.RestrictPrivateChannelManagement
+	defer func() {
+		*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = restrictPublicChannel
+		*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = restrictPrivateChannel
+		utils.IsLicensed = isLicensed
+		utils.SetDefaultRolesBasedOnConfig()
+	}()
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_ALL
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_ALL
+	utils.IsLicensed = true
+	utils.SetDefaultRolesBasedOnConfig()
+
+	channel2 := th.CreateChannel(Client, team)
+	channel3 := th.CreatePrivateChannel(Client, team)
+
+	LinkUserToTeam(th.BasicUser, team)
+
+	Client.Must(Client.AddChannelMember(channel2.Id, th.BasicUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.BasicUser.Id))
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.UpdateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannel(channel2); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+	if _, err := Client.UpdateChannel(channel3); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+
+	UpdateUserToTeamAdmin(th.BasicUser, team)
+	Client.Logout()
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.UpdateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannel(channel2); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+	if _, err := Client.UpdateChannel(channel3); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+
+	th.LoginSystemAdmin()
+
+	if _, err := Client.UpdateChannel(channel2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannel(channel3); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestUpdateChannelDesc(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+func TestUpdateChannelHeader(t *testing.T) {
+	th := Setup().InitBasic().InitSystemAdmin()
+	Client := th.BasicClient
+	SystemAdminClient := th.SystemAdminClient
+	team := th.BasicTeam
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
 
 	data := make(map[string]string)
 	data["channel_id"] = channel1.Id
-	data["channel_description"] = "new desc"
+	data["channel_header"] = "new header"
 
 	var upChannel1 *model.Channel
-	if result, err := Client.UpdateChannelDesc(data); err != nil {
+	if result, err := Client.UpdateChannelHeader(data); err != nil {
 		t.Fatal(err)
 	} else {
 		upChannel1 = result.Data.(*model.Channel)
 	}
 
-	if upChannel1.Description != data["channel_description"] {
-		t.Fatal("Failed to update desc")
+	time.Sleep(100 * time.Millisecond)
+
+	r1 := Client.Must(Client.GetPosts(channel1.Id, 0, 1, "")).Data.(*model.PostList)
+	if len(r1.Order) != 1 {
+		t.Fatal("Header update system message was not found")
+	} else if val, ok := r1.Posts[r1.Order[0]].Props["old_header"]; !ok || val != "" {
+		t.Fatal("Props should contain old_header with old header value")
+	} else if val, ok := r1.Posts[r1.Order[0]].Props["new_header"]; !ok || val != "new header" {
+		t.Fatal("Props should contain new_header with new header value")
+	}
+
+	if upChannel1.Header != data["channel_header"] {
+		t.Fatal("Failed to update header")
 	}
 
 	data["channel_id"] = "junk"
-	if _, err := Client.UpdateChannelDesc(data); err == nil {
+	if _, err := Client.UpdateChannelHeader(data); err == nil {
 		t.Fatal("should have errored on junk channel id")
 	}
 
 	data["channel_id"] = "12345678901234567890123456"
-	if _, err := Client.UpdateChannelDesc(data); err == nil {
+	if _, err := Client.UpdateChannelHeader(data); err == nil {
 		t.Fatal("should have errored on non-existent channel id")
 	}
 
 	data["channel_id"] = channel1.Id
-	data["channel_description"] = ""
-	for i := 0; i < 1050; i++ {
-		data["channel_description"] += "a"
-	}
-	if _, err := Client.UpdateChannelDesc(data); err == nil {
-		t.Fatal("should have errored on bad channel desc")
+	data["channel_header"] = strings.Repeat("a", 1050)
+	if _, err := Client.UpdateChannelHeader(data); err == nil {
+		t.Fatal("should have errored on bad channel header")
 	}
 
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
+	rchannel := Client.Must(Client.CreateDirectChannel(th.BasicUser2.Id)).Data.(*model.Channel)
+	data["channel_id"] = rchannel.Id
+	data["channel_header"] = "new header"
+	var upChanneld *model.Channel
+	if result, err := Client.UpdateChannelHeader(data); err != nil {
+		t.Fatal(err)
+	} else {
+		upChanneld = result.Data.(*model.Channel)
+	}
 
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	if upChanneld.Header != data["channel_header"] {
+		t.Fatal("Failed to update header")
+	}
+
+	th.LoginBasic2()
 
 	data["channel_id"] = channel1.Id
-	data["channel_description"] = "new desc"
-	if _, err := Client.UpdateChannelDesc(data); err == nil {
-		t.Fatal("should have errored non-channel member trying to update desc")
+	data["channel_header"] = "new header"
+	if _, err := Client.UpdateChannelHeader(data); err == nil {
+		t.Fatal("should have errored non-channel member trying to update header")
+	}
+
+	isLicensed := utils.IsLicensed
+	restrictPublicChannel := *utils.Cfg.TeamSettings.RestrictPublicChannelManagement
+	restrictPrivateChannel := *utils.Cfg.TeamSettings.RestrictPrivateChannelManagement
+	defer func() {
+		*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = restrictPublicChannel
+		*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = restrictPrivateChannel
+		utils.IsLicensed = isLicensed
+		utils.SetDefaultRolesBasedOnConfig()
+	}()
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_ALL
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_ALL
+	utils.IsLicensed = true
+	utils.SetDefaultRolesBasedOnConfig()
+
+	th.LoginBasic()
+	channel2 := th.CreateChannel(Client, team)
+	channel3 := th.CreatePrivateChannel(Client, team)
+
+	data2 := make(map[string]string)
+	data2["channel_id"] = channel2.Id
+	data2["channel_header"] = "new header"
+
+	data3 := make(map[string]string)
+	data3["channel_id"] = channel3.Id
+	data3["channel_header"] = "new header"
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.UpdateChannelHeader(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannelHeader(data3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannelHeader(data2); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+	if _, err := Client.UpdateChannelHeader(data3); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+
+	UpdateUserToTeamAdmin(th.BasicUser, team)
+	Client.Logout()
+	th.LoginBasic()
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.UpdateChannelHeader(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannelHeader(data3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannelHeader(data2); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+	if _, err := Client.UpdateChannelHeader(data3); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+
+	LinkUserToTeam(th.SystemAdminUser, team)
+	Client.Must(Client.AddChannelMember(channel2.Id, th.SystemAdminUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.SystemAdminUser.Id))
+	th.LoginSystemAdmin()
+
+	if _, err := SystemAdminClient.UpdateChannelHeader(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SystemAdminClient.UpdateChannelHeader(data3); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdateChannelPurpose(t *testing.T) {
+	th := Setup().InitBasic().InitSystemAdmin()
+	Client := th.BasicClient
+	SystemAdminClient := th.SystemAdminClient
+	team := th.BasicTeam
+
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
+
+	data := make(map[string]string)
+	data["channel_id"] = channel1.Id
+	data["channel_purpose"] = "new purpose"
+
+	var upChannel1 *model.Channel
+	if result, err := Client.UpdateChannelPurpose(data); err != nil {
+		t.Fatal(err)
+	} else {
+		upChannel1 = result.Data.(*model.Channel)
+	}
+
+	if upChannel1.Purpose != data["channel_purpose"] {
+		t.Fatal("Failed to update purpose")
+	}
+
+	data["channel_id"] = "junk"
+	if _, err := Client.UpdateChannelPurpose(data); err == nil {
+		t.Fatal("should have errored on junk channel id")
+	}
+
+	data["channel_id"] = "12345678901234567890123456"
+	if _, err := Client.UpdateChannelPurpose(data); err == nil {
+		t.Fatal("should have errored on non-existent channel id")
+	}
+
+	data["channel_id"] = channel1.Id
+	data["channel_purpose"] = strings.Repeat("a", 350)
+	if _, err := Client.UpdateChannelPurpose(data); err == nil {
+		t.Fatal("should have errored on bad channel purpose")
+	}
+
+	th.LoginBasic2()
+
+	data["channel_id"] = channel1.Id
+	data["channel_purpose"] = "new purpose"
+	if _, err := Client.UpdateChannelPurpose(data); err == nil {
+		t.Fatal("should have errored non-channel member trying to update purpose")
+	}
+
+	isLicensed := utils.IsLicensed
+	restrictPublicChannel := *utils.Cfg.TeamSettings.RestrictPublicChannelManagement
+	restrictPrivateChannel := *utils.Cfg.TeamSettings.RestrictPrivateChannelManagement
+	defer func() {
+		*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = restrictPublicChannel
+		*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = restrictPrivateChannel
+		utils.IsLicensed = isLicensed
+		utils.SetDefaultRolesBasedOnConfig()
+	}()
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_ALL
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_ALL
+	utils.IsLicensed = true
+	utils.SetDefaultRolesBasedOnConfig()
+
+	th.LoginBasic()
+	channel2 := th.CreateChannel(Client, team)
+	channel3 := th.CreatePrivateChannel(Client, team)
+
+	data2 := make(map[string]string)
+	data2["channel_id"] = channel2.Id
+	data2["channel_purpose"] = "new purpose"
+
+	data3 := make(map[string]string)
+	data3["channel_id"] = channel3.Id
+	data3["channel_purpose"] = "new purpose"
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.UpdateChannelPurpose(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannelPurpose(data3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannelPurpose(data2); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+	if _, err := Client.UpdateChannelPurpose(data3); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+
+	UpdateUserToTeamAdmin(th.BasicUser, team)
+	Client.Logout()
+	th.LoginBasic()
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.UpdateChannelPurpose(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.UpdateChannelPurpose(data3); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	if _, err := Client.UpdateChannelPurpose(data2); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+	if _, err := Client.UpdateChannelPurpose(data3); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+
+	LinkUserToTeam(th.SystemAdminUser, team)
+	Client.Must(Client.AddChannelMember(channel2.Id, th.SystemAdminUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.SystemAdminUser.Id))
+	th.LoginSystemAdmin()
+
+	if _, err := SystemAdminClient.UpdateChannelPurpose(data2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SystemAdminClient.UpdateChannelPurpose(data3); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestGetChannel(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+	team2 := th.CreateTeam(Client)
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -280,13 +656,13 @@ func TestGetChannel(t *testing.T) {
 	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
 
 	rget := Client.Must(Client.GetChannels(""))
-	data := rget.Data.(*model.ChannelList)
+	channels := rget.Data.(*model.ChannelList)
 
-	if data.Channels[0].DisplayName != channel1.DisplayName {
+	if (*channels)[0].DisplayName != channel1.DisplayName {
 		t.Fatal("full name didn't match")
 	}
 
-	if data.Channels[1].DisplayName != channel2.DisplayName {
+	if (*channels)[1].DisplayName != channel2.DisplayName {
 		t.Fatal("full name didn't match")
 	}
 
@@ -298,22 +674,41 @@ func TestGetChannel(t *testing.T) {
 		t.Fatal("cache should be empty")
 	}
 
-	if _, err := Client.UpdateLastViewedAt(channel2.Id); err != nil {
+	if _, err := Client.UpdateLastViewedAt(channel2.Id, true); err != nil {
 		t.Fatal(err)
+	}
+
+	if resp, err := Client.GetChannel(channel1.Id, ""); err != nil {
+		t.Fatal(err)
+	} else {
+		data := resp.Data.(*model.ChannelData)
+		if data.Channel.DisplayName != channel1.DisplayName {
+			t.Fatal("name didn't match")
+		}
+
+		// test etag caching
+		if cache_result, err := Client.GetChannel(channel1.Id, resp.Etag); err != nil {
+			t.Fatal(err)
+		} else if cache_result.Data.(*model.ChannelData) != nil {
+			t.Log(cache_result.Data)
+			t.Fatal("cache should be empty")
+		}
+	}
+
+	if _, err := Client.GetChannel("junk", ""); err == nil {
+		t.Fatal("should have failed - bad channel id")
+	}
+
+	Client.SetTeamId(team2.Id)
+	if _, err := Client.GetChannel(channel2.Id, ""); err == nil {
+		t.Fatal("should have failed - wrong team")
 	}
 }
 
 func TestGetMoreChannel(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user1 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user1 = Client.Must(Client.CreateUser(user1, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user1.Id)
-
-	Client.LoginByEmail(team.Domain, user1.Email, "pwd")
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -321,20 +716,16 @@ func TestGetMoreChannel(t *testing.T) {
 	channel2 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
 
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
-
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	th.LoginBasic2()
 
 	rget := Client.Must(Client.GetMoreChannels(""))
-	data := rget.Data.(*model.ChannelList)
+	channels := rget.Data.(*model.ChannelList)
 
-	if data.Channels[0].DisplayName != channel1.DisplayName {
+	if (*channels)[0].DisplayName != channel1.DisplayName {
 		t.Fatal("full name didn't match")
 	}
 
-	if data.Channels[1].DisplayName != channel2.DisplayName {
+	if (*channels)[1].DisplayName != channel2.DisplayName {
 		t.Fatal("full name didn't match")
 	}
 
@@ -347,17 +738,68 @@ func TestGetMoreChannel(t *testing.T) {
 	}
 }
 
-func TestJoinChannel(t *testing.T) {
-	Setup()
+func TestGetChannelCounts(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
 
-	user1 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user1 = Client.Must(Client.CreateUser(user1, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user1.Id)
+	channel2 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
 
-	Client.LoginByEmail(team.Domain, user1.Email, "pwd")
+	if result, err := Client.GetChannelCounts(""); err != nil {
+		t.Fatal(err)
+	} else {
+		counts := result.Data.(*model.ChannelCounts)
+
+		if len(counts.Counts) != 5 {
+			t.Fatal("wrong number of channel counts")
+		}
+
+		if len(counts.UpdateTimes) != 5 {
+			t.Fatal("wrong number of channel update times")
+		}
+
+		if cache_result, err := Client.GetChannelCounts(result.Etag); err != nil {
+			t.Fatal(err)
+		} else if cache_result.Data.(*model.ChannelCounts) != nil {
+			t.Log(cache_result.Data)
+			t.Fatal("result data should be empty")
+		}
+	}
+
+}
+
+func TestGetMyChannelMembers(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
+
+	channel2 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
+
+	if result, err := Client.GetMyChannelMembers(); err != nil {
+		t.Fatal(err)
+	} else {
+		members := result.Data.(*model.ChannelMembers)
+
+		// town-square, off-topic, basic test channel, channel1, channel2
+		if len(*members) != 5 {
+			t.Fatal("wrong number of members", len(*members))
+		}
+	}
+
+}
+
+func TestJoinChannelById(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -365,11 +807,7 @@ func TestJoinChannel(t *testing.T) {
 	channel3 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_PRIVATE, TeamId: team.Id}
 	channel3 = Client.Must(Client.CreateChannel(channel3)).Data.(*model.Channel)
 
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
-
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	th.LoginBasic2()
 
 	Client.Must(Client.JoinChannel(channel1.Id))
 
@@ -377,31 +815,35 @@ func TestJoinChannel(t *testing.T) {
 		t.Fatal("shouldn't be able to join secret group")
 	}
 
-	data := make(map[string]string)
-	data["user_id"] = user1.Id
-	rchannel := Client.Must(Client.CreateDirectChannel(data)).Data.(*model.Channel)
+	rchannel := Client.Must(Client.CreateDirectChannel(th.BasicUser.Id)).Data.(*model.Channel)
 
-	user3 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user3 = Client.Must(Client.CreateUser(user3, "")).Data.(*model.User)
-
-	Client.LoginByEmail(team.Domain, user3.Email, "pwd")
+	user3 := th.CreateUser(th.BasicClient)
+	LinkUserToTeam(user3, team)
+	Client.Must(Client.Login(user3.Email, "Password1"))
 
 	if _, err := Client.JoinChannel(rchannel.Id); err == nil {
 		t.Fatal("shoudn't be able to join direct channel")
 	}
+
+	th.LoginBasic()
+
+	if _, err := Client.JoinChannel(channel1.Id); err != nil {
+		t.Fatal("should be able to join public channel that we're a member of")
+	}
+
+	if _, err := Client.JoinChannel(channel3.Id); err != nil {
+		t.Fatal("should be able to join private channel that we're a member of")
+	}
+
+	if _, err := Client.JoinChannel(rchannel.Id); err != nil {
+		t.Fatal("should be able to join direct channel that we're a member of")
+	}
 }
 
-func TestLeaveChannel(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user1 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user1 = Client.Must(Client.CreateUser(user1, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user1.Id)
-
-	Client.LoginByEmail(team.Domain, user1.Email, "pwd")
+func TestJoinChannelByName(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -409,20 +851,79 @@ func TestLeaveChannel(t *testing.T) {
 	channel3 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_PRIVATE, TeamId: team.Id}
 	channel3 = Client.Must(Client.CreateChannel(channel3)).Data.(*model.Channel)
 
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
+	th.LoginBasic2()
 
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	Client.Must(Client.JoinChannelByName(channel1.Name))
+
+	if _, err := Client.JoinChannelByName(channel3.Name); err == nil {
+		t.Fatal("shouldn't be able to join secret group")
+	}
+
+	rchannel := Client.Must(Client.CreateDirectChannel(th.BasicUser.Id)).Data.(*model.Channel)
+
+	user3 := th.CreateUser(th.BasicClient)
+	LinkUserToTeam(user3, team)
+	Client.Must(Client.Login(user3.Email, "Password1"))
+
+	if _, err := Client.JoinChannelByName(rchannel.Name); err == nil {
+		t.Fatal("shoudn't be able to join direct channel")
+	}
+
+	th.LoginBasic()
+
+	if _, err := Client.JoinChannelByName(channel1.Name); err != nil {
+		t.Fatal("should be able to join public channel that we're a member of")
+	}
+
+	if _, err := Client.JoinChannelByName(channel3.Name); err != nil {
+		t.Fatal("should be able to join private channel that we're a member of")
+	}
+
+	if _, err := Client.JoinChannelByName(rchannel.Name); err != nil {
+		t.Fatal("should be able to join direct channel that we're a member of")
+	}
+}
+
+func TestJoinChannelByNameDisabledUser(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
+
+	Client.Must(th.BasicClient.RemoveUserFromTeam(th.BasicTeam.Id, th.BasicUser.Id))
+
+	if _, err := AddUserToChannel(th.BasicUser, channel1); err == nil {
+		t.Fatal("shoudn't be able to join channel")
+	} else {
+		if err.Id != "api.channel.add_user.to.channel.failed.deleted.app_error" {
+			t.Fatal("wrong error")
+		}
+	}
+}
+
+func TestLeaveChannel(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
+
+	channel3 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_PRIVATE, TeamId: team.Id}
+	channel3 = Client.Must(Client.CreateChannel(channel3)).Data.(*model.Channel)
+
+	th.LoginBasic2()
 
 	Client.Must(Client.JoinChannel(channel1.Id))
 
-	// No error if you leave a channel you cannot see
-	Client.Must(Client.LeaveChannel(channel3.Id))
+	// Cannot leave a the private group if you are the only member
+	if _, err := Client.LeaveChannel(channel3.Id); err == nil {
+		t.Fatal("should have errored, cannot leave private group if only one member")
+	}
 
-	data := make(map[string]string)
-	data["user_id"] = user1.Id
-	rchannel := Client.Must(Client.CreateDirectChannel(data)).Data.(*model.Channel)
+	rchannel := Client.Must(Client.CreateDirectChannel(th.BasicUser.Id)).Data.(*model.Channel)
 
 	if _, err := Client.LeaveChannel(rchannel.Id); err == nil {
 		t.Fatal("should have errored, cannot leave direct channel")
@@ -430,7 +931,7 @@ func TestLeaveChannel(t *testing.T) {
 
 	rget := Client.Must(Client.GetChannels(""))
 	cdata := rget.Data.(*model.ChannelList)
-	for _, c := range cdata.Channels {
+	for _, c := range *cdata {
 		if c.Name == model.DEFAULT_CHANNEL {
 			if _, err := Client.LeaveChannel(c.Id); err == nil {
 				t.Fatal("should have errored on leaving default channel")
@@ -441,27 +942,23 @@ func TestLeaveChannel(t *testing.T) {
 }
 
 func TestDeleteChannel(t *testing.T) {
-	Setup()
+	th := Setup().InitBasic().InitSystemAdmin()
+	Client := th.SystemAdminClient
+	team := th.SystemAdminTeam
+	userSystemAdmin := th.SystemAdminUser
+	userTeamAdmin := th.CreateUser(Client)
+	LinkUserToTeam(userTeamAdmin, team)
+	user2 := th.CreateUser(Client)
+	LinkUserToTeam(user2, team)
 
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	userTeamAdmin := &model.User{TeamId: team.Id, Email: team.Email, FullName: "Corey Hulen", Password: "pwd"}
-	userTeamAdmin = Client.Must(Client.CreateUser(userTeamAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userTeamAdmin.Id)
-
-	userChannelAdmin := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userChannelAdmin = Client.Must(Client.CreateUser(userChannelAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userChannelAdmin.Id)
-
-	Client.LoginByEmail(team.Domain, userChannelAdmin.Email, "pwd")
+	Client.Login(user2.Email, user2.Password)
 
 	channelMadeByCA := &model.Channel{DisplayName: "C Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channelMadeByCA = Client.Must(Client.CreateChannel(channelMadeByCA)).Data.(*model.Channel)
 
 	Client.AddChannelMember(channelMadeByCA.Id, userTeamAdmin.Id)
 
-	Client.LoginByEmail(team.Domain, userTeamAdmin.Email, "pwd")
+	Client.Login(userTeamAdmin.Email, "pwd")
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -482,11 +979,9 @@ func TestDeleteChannel(t *testing.T) {
 		t.Fatal("should have failed to post to deleted channel")
 	}
 
-	userStd := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userStd = Client.Must(Client.CreateUser(userStd, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userStd.Id)
-
-	Client.LoginByEmail(team.Domain, userStd.Email, "pwd")
+	userStd := th.CreateUser(Client)
+	LinkUserToTeam(userStd, team)
+	Client.Login(userStd.Email, userStd.Password)
 
 	if _, err := Client.JoinChannel(channel1.Id); err == nil {
 		t.Fatal("should have failed to join deleted channel")
@@ -494,13 +989,13 @@ func TestDeleteChannel(t *testing.T) {
 
 	Client.Must(Client.JoinChannel(channel2.Id))
 
-	if _, err := Client.DeleteChannel(channel2.Id); err == nil {
-		t.Fatal("should have failed to delete channel you're not an admin of")
+	if _, err := Client.DeleteChannel(channel2.Id); err != nil {
+		t.Fatal(err)
 	}
 
 	rget := Client.Must(Client.GetChannels(""))
 	cdata := rget.Data.(*model.ChannelList)
-	for _, c := range cdata.Channels {
+	for _, c := range *cdata {
 		if c.Name == model.DEFAULT_CHANNEL {
 			if _, err := Client.DeleteChannel(c.Id); err == nil {
 				t.Fatal("should have errored on deleting default channel")
@@ -508,47 +1003,160 @@ func TestDeleteChannel(t *testing.T) {
 			break
 		}
 	}
+
+	UpdateUserToTeamAdmin(userStd, team)
+
+	Client.Logout()
+	Client.Login(userStd.Email, userStd.Password)
+	Client.SetTeamId(team.Id)
+
+	channel2 = th.CreateChannel(Client, team)
+
+	if _, err := Client.DeleteChannel(channel2.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	channel3 := &model.Channel{DisplayName: "B Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel3 = Client.Must(Client.CreateChannel(channel3)).Data.(*model.Channel)
+
+	Client.Login(userSystemAdmin.Email, userSystemAdmin.Password)
+	Client.Must(Client.JoinChannel(channel3.Id))
+
+	if _, err := Client.DeleteChannel(channel3.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Client.DeleteChannel(channel3.Id); err == nil {
+		t.Fatal("should have failed - channel already deleted")
+	}
+
+	isLicensed := utils.IsLicensed
+	restrictPublicChannel := *utils.Cfg.TeamSettings.RestrictPublicChannelManagement
+	restrictPrivateChannel := *utils.Cfg.TeamSettings.RestrictPrivateChannelManagement
+	defer func() {
+		*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = restrictPublicChannel
+		*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = restrictPrivateChannel
+		utils.IsLicensed = isLicensed
+		utils.SetDefaultRolesBasedOnConfig()
+	}()
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_ALL
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_ALL
+	utils.IsLicensed = true
+	utils.SetDefaultRolesBasedOnConfig()
+
+	th.LoginSystemAdmin()
+	LinkUserToTeam(th.BasicUser, team)
+
+	channel2 = th.CreateChannel(Client, team)
+	channel3 = th.CreatePrivateChannel(Client, team)
+	channel4 := th.CreateChannel(Client, team)
+	Client.Must(Client.AddChannelMember(channel2.Id, th.BasicUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.BasicUser.Id))
+	Client.Must(Client.AddChannelMember(channel4.Id, th.BasicUser.Id))
+	Client.Must(Client.LeaveChannel(channel4.Id))
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.DeleteChannel(channel2.Id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.DeleteChannel(channel3.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_TEAM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	th.LoginSystemAdmin()
+
+	channel2 = th.CreateChannel(Client, team)
+	channel3 = th.CreatePrivateChannel(Client, team)
+	Client.Must(Client.AddChannelMember(channel2.Id, th.BasicUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.BasicUser.Id))
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.DeleteChannel(channel2.Id); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+	if _, err := Client.DeleteChannel(channel3.Id); err == nil {
+		t.Fatal("should have errored not team admin")
+	}
+
+	UpdateUserToTeamAdmin(th.BasicUser, team)
+	Client.Logout()
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+	Client.SetTeamId(team.Id)
+
+	if _, err := Client.DeleteChannel(channel2.Id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.DeleteChannel(channel3.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	*utils.Cfg.TeamSettings.RestrictPublicChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	*utils.Cfg.TeamSettings.RestrictPrivateChannelManagement = model.PERMISSIONS_SYSTEM_ADMIN
+	utils.SetDefaultRolesBasedOnConfig()
+
+	th.LoginSystemAdmin()
+
+	channel2 = th.CreateChannel(Client, team)
+	channel3 = th.CreatePrivateChannel(Client, team)
+	Client.Must(Client.AddChannelMember(channel2.Id, th.BasicUser.Id))
+	Client.Must(Client.AddChannelMember(channel3.Id, th.BasicUser.Id))
+
+	Client.Login(th.BasicUser.Email, th.BasicUser.Password)
+
+	if _, err := Client.DeleteChannel(channel2.Id); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+	if _, err := Client.DeleteChannel(channel3.Id); err == nil {
+		t.Fatal("should have errored not system admin")
+	}
+
+	// Only one left in channel, should be able to delete
+	if _, err := Client.DeleteChannel(channel4.Id); err != nil {
+		t.Fatal(err)
+	}
+
+	th.LoginSystemAdmin()
+
+	if _, err := Client.DeleteChannel(channel2.Id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Client.DeleteChannel(channel3.Id); err != nil {
+		t.Fatal(err)
+	}
 }
 
-func TestGetChannelExtraInfo(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+func TestGetChannelStats(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
 
-	rget := Client.Must(Client.GetChannelExtraInfo(channel1.Id)).Data.(*model.ChannelExtra)
-	if rget.Id != channel1.Id {
+	rget := Client.Must(Client.GetChannelStats(channel1.Id, ""))
+	data := rget.Data.(*model.ChannelStats)
+	if data.ChannelId != channel1.Id {
 		t.Fatal("couldnt't get extra info")
+	} else if data.MemberCount != 1 {
+		t.Fatal("got incorrect member count")
 	}
 }
 
 func TestAddChannelMember(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user1 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user1 = Client.Must(Client.CreateUser(user1, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user1.Id)
-
-	Client.LoginByEmail(team.Domain, user1.Email, "pwd")
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+	user2 := th.BasicUser2
+	user3 := th.CreateUser(Client)
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
-
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user2.Id)
 
 	if _, err := Client.AddChannelMember(channel1.Id, user2.Id); err != nil {
 		t.Fatal(err)
@@ -562,8 +1170,8 @@ func TestAddChannelMember(t *testing.T) {
 		t.Fatal("Should have errored, bad user id")
 	}
 
-	if _, err := Client.AddChannelMember(channel1.Id, user2.Id); err == nil {
-		t.Fatal("Should have errored, user already a member")
+	if _, err := Client.AddChannelMember(channel1.Id, user2.Id); err != nil {
+		t.Fatal(err)
 	}
 
 	if _, err := Client.AddChannelMember("sgdsgsdg", user2.Id); err == nil {
@@ -573,13 +1181,13 @@ func TestAddChannelMember(t *testing.T) {
 	channel2 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
 
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	th.LoginBasic2()
 
 	if _, err := Client.AddChannelMember(channel2.Id, user2.Id); err == nil {
 		t.Fatal("Should have errored, user not in channel")
 	}
 
-	Client.LoginByEmail(team.Domain, user1.Email, "pwd")
+	th.LoginBasic()
 
 	Client.Must(Client.DeleteChannel(channel2.Id))
 
@@ -587,37 +1195,30 @@ func TestAddChannelMember(t *testing.T) {
 		t.Fatal("Should have errored, channel deleted")
 	}
 
+	if _, err := Client.AddChannelMember(channel1.Id, user3.Id); err == nil {
+		t.Fatal("Should have errored, user not on team")
+	}
 }
 
 func TestRemoveChannelMember(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	userTeamAdmin := &model.User{TeamId: team.Id, Email: team.Email, FullName: "Corey Hulen", Password: "pwd"}
-	userTeamAdmin = Client.Must(Client.CreateUser(userTeamAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userTeamAdmin.Id)
-
-	userChannelAdmin := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userChannelAdmin = Client.Must(Client.CreateUser(userChannelAdmin, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userChannelAdmin.Id)
-
-	Client.LoginByEmail(team.Domain, userChannelAdmin.Email, "pwd")
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+	user2 := th.BasicUser2
+	UpdateUserToTeamAdmin(user2, team)
 
 	channelMadeByCA := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channelMadeByCA = Client.Must(Client.CreateChannel(channelMadeByCA)).Data.(*model.Channel)
 
-	Client.Must(Client.AddChannelMember(channelMadeByCA.Id, userTeamAdmin.Id))
+	Client.Must(Client.AddChannelMember(channelMadeByCA.Id, user2.Id))
 
-	Client.LoginByEmail(team.Domain, userTeamAdmin.Email, "pwd")
+	th.LoginBasic2()
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
 
-	userStd := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	userStd = Client.Must(Client.CreateUser(userStd, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(userStd.Id)
+	userStd := th.CreateUser(th.BasicClient)
+	LinkUserToTeam(userStd, team)
 
 	Client.Must(Client.AddChannelMember(channel1.Id, userStd.Id))
 
@@ -642,13 +1243,13 @@ func TestRemoveChannelMember(t *testing.T) {
 	channel2 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel2 = Client.Must(Client.CreateChannel(channel2)).Data.(*model.Channel)
 
-	Client.LoginByEmail(team.Domain, userStd.Email, "pwd")
+	Client.Login(userStd.Email, userStd.Password)
 
 	if _, err := Client.RemoveChannelMember(channel2.Id, userStd.Id); err == nil {
 		t.Fatal("Should have errored, user not channel admin")
 	}
 
-	Client.LoginByEmail(team.Domain, userTeamAdmin.Email, "pwd")
+	th.LoginBasic2()
 	Client.Must(Client.AddChannelMember(channel2.Id, userStd.Id))
 
 	Client.Must(Client.DeleteChannel(channel2.Id))
@@ -659,17 +1260,12 @@ func TestRemoveChannelMember(t *testing.T) {
 
 }
 
-func TestUpdateNotifyLevel(t *testing.T) {
-	Setup()
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+func TestUpdateNotifyProps(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+	user := th.BasicUser
+	user2 := th.BasicUser2
 
 	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
 	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
@@ -677,79 +1273,108 @@ func TestUpdateNotifyLevel(t *testing.T) {
 	data := make(map[string]string)
 	data["channel_id"] = channel1.Id
 	data["user_id"] = user.Id
-	data["notify_level"] = model.CHANNEL_NOTIFY_MENTION
+	data["desktop"] = model.CHANNEL_NOTIFY_MENTION
 
-	if _, err := Client.UpdateNotifyLevel(data); err != nil {
+	//timeBeforeUpdate := model.GetMillis()
+	time.Sleep(100 * time.Millisecond)
+
+	// test updating desktop
+	if result, err := Client.UpdateNotifyProps(data); err != nil {
 		t.Fatal(err)
+	} else if notifyProps := result.Data.(map[string]string); notifyProps["desktop"] != model.CHANNEL_NOTIFY_MENTION {
+		t.Fatal("NotifyProps[\"desktop\"] did not update properly")
+	} else if notifyProps["mark_unread"] != model.CHANNEL_MARK_UNREAD_ALL {
+		t.Fatalf("NotifyProps[\"mark_unread\"] changed to %v", notifyProps["mark_unread"])
 	}
 
-	rget := Client.Must(Client.GetChannels(""))
-	rdata := rget.Data.(*model.ChannelList)
-	if len(rdata.Members) == 0 || rdata.Members[channel1.Id].NotifyLevel != data["notify_level"] {
-		t.Fatal("NotifyLevel did not update properly")
+	// test an empty update
+	delete(data, "desktop")
+
+	if result, err := Client.UpdateNotifyProps(data); err != nil {
+		t.Fatal(err)
+	} else if notifyProps := result.Data.(map[string]string); notifyProps["mark_unread"] != model.CHANNEL_MARK_UNREAD_ALL {
+		t.Fatalf("NotifyProps[\"mark_unread\"] changed to %v", notifyProps["mark_unread"])
+	} else if notifyProps["desktop"] != model.CHANNEL_NOTIFY_MENTION {
+		t.Fatalf("NotifyProps[\"desktop\"] changed to %v", notifyProps["desktop"])
 	}
 
+	// test updating mark unread
+	data["mark_unread"] = model.CHANNEL_MARK_UNREAD_MENTION
+
+	if result, err := Client.UpdateNotifyProps(data); err != nil {
+		t.Fatal(err)
+	} else if notifyProps := result.Data.(map[string]string); notifyProps["mark_unread"] != model.CHANNEL_MARK_UNREAD_MENTION {
+		t.Fatal("NotifyProps[\"mark_unread\"] did not update properly")
+	} else if notifyProps["desktop"] != model.CHANNEL_NOTIFY_MENTION {
+		t.Fatalf("NotifyProps[\"desktop\"] changed to %v", notifyProps["desktop"])
+	}
+
+	// test updating both
+	data["desktop"] = model.CHANNEL_NOTIFY_NONE
+	data["mark_unread"] = model.CHANNEL_MARK_UNREAD_MENTION
+
+	if result, err := Client.UpdateNotifyProps(data); err != nil {
+		t.Fatal(err)
+	} else if notifyProps := result.Data.(map[string]string); notifyProps["desktop"] != model.CHANNEL_NOTIFY_NONE {
+		t.Fatal("NotifyProps[\"desktop\"] did not update properly")
+	} else if notifyProps["mark_unread"] != model.CHANNEL_MARK_UNREAD_MENTION {
+		t.Fatal("NotifyProps[\"mark_unread\"] did not update properly")
+	}
+
+	// test error cases
 	data["user_id"] = "junk"
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
 		t.Fatal("Should have errored - bad user id")
 	}
 
 	data["user_id"] = "12345678901234567890123456"
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
 		t.Fatal("Should have errored - bad user id")
 	}
 
 	data["user_id"] = user.Id
 	data["channel_id"] = "junk"
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
 		t.Fatal("Should have errored - bad channel id")
 	}
 
 	data["channel_id"] = "12345678901234567890123456"
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
 		t.Fatal("Should have errored - bad channel id")
 	}
 
-	data["channel_id"] = channel1.Id
-	data["notify_level"] = ""
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
-		t.Fatal("Should have errored - empty notify level")
+	data["desktop"] = "junk"
+	data["mark_unread"] = model.CHANNEL_MARK_UNREAD_ALL
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
+		t.Fatal("Should have errored - bad desktop notify level")
 	}
 
-	data["notify_level"] = "junk"
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
-		t.Fatal("Should have errored - bad notify level")
+	data["desktop"] = model.CHANNEL_NOTIFY_ALL
+	data["mark_unread"] = "junk"
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
+		t.Fatal("Should have errored - bad mark unread level")
 	}
 
-	user2 := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user2 = Client.Must(Client.CreateUser(user2, "")).Data.(*model.User)
-
-	Client.LoginByEmail(team.Domain, user2.Email, "pwd")
+	th.LoginBasic2()
 
 	data["channel_id"] = channel1.Id
 	data["user_id"] = user2.Id
-	data["notify_level"] = model.CHANNEL_NOTIFY_MENTION
-	if _, err := Client.UpdateNotifyLevel(data); err == nil {
+	data["desktop"] = model.CHANNEL_NOTIFY_MENTION
+	data["mark_unread"] = model.CHANNEL_MARK_UNREAD_MENTION
+	if _, err := Client.UpdateNotifyProps(data); err == nil {
 		t.Fatal("Should have errored - user not in channel")
 	}
 }
 
 func TestFuzzyChannel(t *testing.T) {
-	Setup();
-
-	team := &model.Team{Name: "Name", Domain: "z-z-" + model.NewId() + "a", Email: "test@nowhere.com", Type: model.TEAM_OPEN}
-	team = Client.Must(Client.CreateTeam(team)).Data.(*model.Team)
-
-	user := &model.User{TeamId: team.Id, Email: model.NewId() + "corey@test.com", FullName: "Corey Hulen", Password: "pwd"}
-	user = Client.Must(Client.CreateUser(user, "")).Data.(*model.User)
-	Srv.Store.User().VerifyEmail(user.Id)
-
-	Client.LoginByEmail(team.Domain, user.Email, "pwd")
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
 
 	// Strings that should pass as acceptable channel names
-	var fuzzyStringsPass = []string { 
+	var fuzzyStringsPass = []string{
 		"*", "?", ".", "}{][)(><", "{}[]()<>",
-		
+
 		"qahwah ( قهوة)",
 		"שָׁלוֹם עֲלֵיכֶם",
 		"Ramen チャーシュー chāshū",
@@ -783,5 +1408,43 @@ func TestFuzzyChannel(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestGetChannelMember(t *testing.T) {
+	th := Setup().InitBasic()
+	Client := th.BasicClient
+	team := th.BasicTeam
+
+	channel1 := &model.Channel{DisplayName: "A Test API Name", Name: "a" + model.NewId() + "a", Type: model.CHANNEL_OPEN, TeamId: team.Id}
+	channel1 = Client.Must(Client.CreateChannel(channel1)).Data.(*model.Channel)
+
+	if result, err := Client.GetChannelMember(channel1.Id, th.BasicUser.Id); err != nil {
+		t.Fatal(err)
+	} else {
+		cm := result.Data.(*model.ChannelMember)
+
+		if cm.UserId != th.BasicUser.Id {
+			t.Fatal("user ids didn't match")
+		}
+		if cm.ChannelId != channel1.Id {
+			t.Fatal("channel ids didn't match")
+		}
+	}
+
+	if _, err := Client.GetChannelMember(channel1.Id, th.BasicUser2.Id); err == nil {
+		t.Fatal("should have failed - user not in channel")
+	}
+
+	if _, err := Client.GetChannelMember("junk", th.BasicUser2.Id); err == nil {
+		t.Fatal("should have failed - bad channel id")
+	}
+
+	if _, err := Client.GetChannelMember(channel1.Id, "junk"); err == nil {
+		t.Fatal("should have failed - bad user id")
+	}
+
+	if _, err := Client.GetChannelMember("junk", "junk"); err == nil {
+		t.Fatal("should have failed - bad channel and user id")
 	}
 }

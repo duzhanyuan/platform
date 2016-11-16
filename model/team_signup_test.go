@@ -1,4 +1,4 @@
-// Copyright (c) 2015 Spinpunch, Inc. All Rights Reserved.
+// Copyright (c) 2015 Mattermost, Inc. All Rights Reserved.
 // See License.txt for license information.
 
 package model
@@ -9,7 +9,7 @@ import (
 )
 
 func TestTeamSignupJson(t *testing.T) {
-	team := Team{Id: NewId(), Name: NewId()}
+	team := Team{Id: NewId(), DisplayName: NewId()}
 	o := TeamSignup{Team: team, Data: "data"}
 	json := o.ToJson()
 	ro := TeamSignupFromJson(strings.NewReader(json))
